@@ -1,12 +1,45 @@
-# gb100test — vLLM 推論與深度 QA 壓測
+# gb100test — vLLM 推論 · 影像生成 · 安全壓測
 
-本專案用於在本機以 [vLLM](https://github.com/vllm-project/vllm) 啟動 OpenAI 相容 API，並對 **NVIDIA Gemma / Llama（NVFP4 等）** 執行多階段並發壓測與 Markdown／JSON 報告輸出。
+本專案在 **NVIDIA GB10 / Blackwell** GPU 上整合三類服務：
+1. **LLM 推論**（vLLM OpenAI 相容 API） — Gemma、Llama、Qwen 3.5
+2. **影像生成**（Diffusers API） — SDXL、FLUX.2-dev GGUF
+3. **自動化測試** — 深度 QA 壓測、影像生成效能測試、安全邊界測試
+
+> create by : bitons & cursor
+
+---
+
+## 目錄
+
+- [環境需求](#環境需求)
+- [建立虛擬環境](#建立虛擬環境)
+- [LLM 服務](#llm-服務)
+  - [Gemma NVFP4](#1-gemma-nvfp4--port-8000)
+  - [Llama NVFP4](#2-llama-nvfp4--port-8001)
+  - [Qwen 3.5](#3-qwen-35--port-8002)
+- [影像生成服務](#影像生成服務)
+  - [SDXL](#1-sdxl-預設)
+  - [FLUX.2-dev GGUF](#2-flux2-dev-gguf-推薦)
+- [測試腳本](#測試腳本)
+  - [深度 QA 壓測](#深度-qa-壓測)
+  - [影像生成效能測試](#影像生成效能測試)
+  - [影像安全邊界測試](#影像安全邊界測試)
+- [環境變數速查表](#環境變數速查表)
+- [專案結構](#專案結構)
+
+---
 
 ## 環境需求
 
-- NVIDIA GPU 與相容的 CUDA 驅動  
-- Python 3.12（與現有 `setup_env.sh` 假設一致；若版本不同請自行調整）  
-- 部分模型需 [Hugging Face](https://huggingface.co) 帳號授權後登入：`huggingface-cli login` 或 `hf auth login`
+| 項目 | 需求 |
+|------|------|
+| GPU | NVIDIA GB10 / Blackwell（或 Ampere+ 亦可） |
+| CUDA | 12.4+ |
+| Python | 3.12 |
+| 磁碟 | 模型快取需 50 GB+ 空間 |
+| HuggingFace | 部分模型需授權：`huggingface-cli login` |
+
+---
 
 ## 建立虛擬環境
 
@@ -14,58 +47,323 @@
 chmod +x setup_env.sh
 ./setup_env.sh
 source vllm_env/bin/activate
-hf auth login   # 若模型要求授權
+
+# 若模型需 HuggingFace 授權（Gemma、FLUX.2-dev 等）
+hf auth login
 ```
 
-依賴列於 `requirements.txt`（含 `vllm`、`torch`、`transformers` 等）。
-
-## 啟動 vLLM 伺服器
-
-| 腳本 | 預設模型系列 | HTTP 埠 | 說明 |
-|------|----------------|---------|------|
-| `start_vllm_server_gemma-4-31b-it-nvfp4.sh` | `nvidia/Gemma-4-31B-IT-NVFP4`（可用 `GEMMA_MODEL_ID` 覆寫） | **8000** | Gemma NVFP4 啟動範例 |
-| `start_vllm_server_llama_31b.sh` | `nvidia/Llama-3.1-8B-Instruct-NVFP4`（可用 `LLAMA_MODEL_ID` 覆寫） | **8001** | 與 Gemma 分埠，避免同機兩服務衝突 |
-
-各腳本內含 `GPU_MEMORY_UTILIZATION`、`VLLM_MAX_MODEL_LEN` 等環境變數說明，可依 VRAM 調整。
-
-## 執行深度 QA 壓測（產生報告）
-
-前置：**對應埠上的 vLLM 已在運行**。
-
-- **Gemma／預設 API（埠 8000）**
-
-  ```bash
-  source vllm_env/bin/activate
-  python run_deep_qa.py
-  ```
-
-- **Llama／預設 API（埠 8001）**
-
-  ```bash
-  source vllm_env/bin/activate
-  python run_deep_qa_llama.py
-  ```
-
-會寫入時間戳檔名的 `.md` 與 `.json`（例如 `run_deep_report-YYMMDD_HHMMSS.*` 或 `run_deep_llama_report-YYMMDD_HHMMSS.*`）。並發、逾時、P95 目標等可透過環境變數調整；詳見 `run_deep_qa.py` 開頭常數與 `run_deep_qa_llama.py` 文件字串。
-
-## 簡易本機推論範例（非 HTTP）
-
-`run_gemma.py` 以 vLLM `LLM` 類別直接載入模型並對少量 prompt 生成；適合快速驗證環境與權重，與 HTTP 壓測流程不同。
-
-```bash
-source vllm_env/bin/activate
-python run_gemma.py
-```
-
-## 專案結構（精簡）
-
-- `run_deep_qa.py` — 壓測核心、環境搜集、報告產生  
-- `run_deep_qa_llama.py` — 覆寫 Llama 預設端點與報告標籤  
-- `fix_env.sh` — 環境修補輔助（依專案實際用途執行）  
-- `*.md` / `*-qa-results.json` — 歷次測試報告與結果（可選是否納入版控）
-
-虛擬環境目錄 `vllm_env/` 與常見快取已列入 `.gitignore`，請勿提交。
+依賴列於 `requirements.txt`，含 `vllm`、`torch`、`diffusers`、`transformers`、`gguf` 等。
 
 ---
 
-*說明文件由 bitons & Cursor 建立。*
+## LLM 服務
+
+### 1. Gemma NVFP4 — port 8000
+
+**腳本：** `start_vllm_server_gemma-4-31b-it-nvfp4.sh`
+
+```bash
+# 使用預設 nvidia/Gemma-4-31B-IT-NVFP4
+./start_vllm_server_gemma-4-31b-it-nvfp4.sh
+
+# 覆寫模型
+GEMMA_MODEL_ID=nvidia/Gemma-4-9B-IT-NVFP4 ./start_vllm_server_gemma-4-31b-it-nvfp4.sh
+```
+
+| 環境變數 | 預設值 | 說明 |
+|----------|--------|------|
+| `GEMMA_MODEL_ID` | `nvidia/Gemma-4-31B-IT-NVFP4` | 模型 repo |
+| `VLLM_DTYPE` | `bfloat16` | 權重精度 |
+| `VLLM_QUANTIZATION` | `nvfp4` | 量化格式 |
+| `GPU_MEMORY_UTILIZATION` | `0.85` | GPU 記憶體使用率（0~1）|
+| `VLLM_MAX_MODEL_LEN` | `16384` | 最大 context 長度（tokens）|
+| `VLLM_MAX_NUM_BATCHED_TOKENS` | `8192` | 單批次最大 tokens |
+| `VLLM_MAX_NUM_SEQS` | `8` | 同時排程序列數 |
+| `VLLM_SWAP_SPACE` | `0` | CPU KV swap 空間（GB），0 = 停用 |
+| `ENABLE_PREFIX_CACHING` | `0` | 1 = 啟用 prefix cache（耗 RAM）|
+
+---
+
+### 2. Llama NVFP4 — port 8001
+
+**腳本：** `start_vllm_server_llama_31b.sh`
+
+```bash
+# 使用預設 nvidia/Llama-3.1-8B-Instruct-NVFP4
+./start_vllm_server_llama_31b.sh
+
+# 切換為 70B FP8 版本
+LLAMA_MODEL_ID=nvidia/Llama-3.1-70B-Instruct-FP8 \
+VLLM_QUANTIZATION=fp8 \
+./start_vllm_server_llama_31b.sh
+
+# 巨型 405B（需極大 VRAM）
+LLAMA_MODEL_ID=nvidia/Llama-3.1-405B-Instruct-NVFP4 ./start_vllm_server_llama_31b.sh
+```
+
+| 環境變數 | 預設值 | 說明 |
+|----------|--------|------|
+| `LLAMA_MODEL_ID` | `nvidia/Llama-3.1-8B-Instruct-NVFP4` | 模型 repo |
+| `VLLM_API_PORT` | `8001` | HTTP 埠（與 Gemma 分開）|
+| `GPU_MEMORY_UTILIZATION` | `0.85` | GPU 記憶體使用率 |
+| `VLLM_MAX_MODEL_LEN` | `16384` | 最大 context 長度 |
+| `VLLM_QUANTIZATION` | `""` | 量化格式（`nvfp4` / `fp8` / 留空）|
+
+---
+
+### 3. Qwen 3.5 — port 8002
+
+**腳本：** `start_vllm_server_qwen3.5.sh`
+
+```bash
+# 使用預設 Qwen/Qwen3.5-9B
+./start_vllm_server_qwen3.5.sh
+
+# 切換為 AWQ 量化版
+QWEN_MODEL_ID=Qwen/Qwen3.5-9B-AWQ \
+VLLM_QUANTIZATION=awq \
+./start_vllm_server_qwen3.5.sh
+```
+
+| 環境變數 | 預設值 | 說明 |
+|----------|--------|------|
+| `QWEN_MODEL_ID` | `Qwen/Qwen3.5-9B` | 模型 repo |
+| `VLLM_API_PORT` | `8002` | HTTP 埠 |
+| `GPU_MEMORY_UTILIZATION` | `0.85` | GPU 記憶體使用率 |
+| `VLLM_MAX_MODEL_LEN` | `16384` | 最大 context 長度 |
+| `VLLM_QUANTIZATION` | `""` | 量化格式（`awq` / `gptq` / 留空）|
+
+腳本會自動偵測 vLLM 版本旗標（`chunked-prefill`、`tool-call-parser`、`log-requests` 等），相容不同 vLLM 版本。
+
+---
+
+## 影像生成服務
+
+影像生成服務由 `image_api_server.py` 提供 **OpenAI 相容端點**：
+
+```
+POST http://localhost:8000/v1/images/generations
+```
+
+支援兩個後端，由 `IMAGE_BACKEND` 環境變數切換。
+
+### 1. SDXL（預設）
+
+**腳本：** `start_image_server.sh`
+
+```bash
+# 預設啟動 stabilityai/stable-diffusion-xl-base-1.0
+./start_image_server.sh
+
+# 指定其他 SDXL 相容模型
+IMAGE_MODEL_ID=stabilityai/sdxl-turbo ./start_image_server.sh
+```
+
+| 環境變數 | 預設值 | 說明 |
+|----------|--------|------|
+| `IMAGE_MODEL_ID` | `stabilityai/stable-diffusion-xl-base-1.0` | 模型 repo |
+| `API_PORT` | `8000` | HTTP 埠 |
+| `IMAGE_BACKEND` | `sdxl` | 後端選擇 |
+
+---
+
+### 2. FLUX.2-dev GGUF（推薦）
+
+**腳本：** `start_image_server_flux2_gguf.sh`
+
+```bash
+./start_image_server_flux2_gguf.sh
+```
+
+> 首次啟動 `torch.compile` 編譯需額外 **1～3 分鐘**，後續請求速度將顯著提升。
+
+#### 前置需求：下載 GGUF 模型
+
+```bash
+# 需先登入 HuggingFace（FLUX.2-dev 為 gated model）
+hf auth login
+
+# 下載 GGUF 量化檔（~9 GB）
+huggingface-cli download gguf-org/flux2-dev-gguf flux2-dev-q4_k_s.gguf
+```
+
+#### FLUX.2-dev GGUF 關鍵設定
+
+| 環境變數 | 預設值 | 說明 |
+|----------|--------|------|
+| `IMAGE_BACKEND` | `flux2_gguf` | 後端選擇 |
+| `IMAGE_MODEL_ID` | `gguf-org/flux2-dev-gguf` | GGUF 模型 repo |
+| `FLUX2_DIT_GGUF` | `flux2-dev-q4_k_s.gguf` | Q4_K_S 量化，節省 VRAM |
+| `FLUX2_BASE_REPO` | `black-forest-labs/FLUX.2-dev` | VAE / Text Encoder 來源 |
+| `FLUX2_DEFAULT_STEPS` | `20` | 預設推論步數 |
+| `FLUX2_DEFAULT_GUIDANCE` | `3.5` | CFG Guidance Scale |
+| `FLUX2_TORCH_COMPILE` | `1` | 啟用 `torch.compile` 加速（首次慢）|
+| `FLUX2_ENABLE_CPU_OFFLOAD` | `0` | `0` = 全程 GPU，`1` = 超出時卸載 CPU |
+| `HF_HUB_OFFLINE` | `1` | 強制使用本機快取，不聯網 |
+| `API_PORT` | `8000` | HTTP 埠 |
+
+#### GB10 / Blackwell 全域最佳化（由 `image_api_server.py` 自動啟用）
+
+```python
+torch.backends.cuda.matmul.allow_tf32 = True   # TF32 矩陣加速
+torch.backends.cudnn.allow_tf32     = True
+torch.backends.cudnn.benchmark      = True       # 自動選最快 kernel
+```
+
+#### 遠端 Text Encoder（選用）
+
+若想減少本機 VRAM 使用，可啟用 HuggingFace 遠端 Text Encoder：
+
+```bash
+FLUX2_REMOTE_TEXT_ENCODER=1 ./start_image_server_flux2_gguf.sh
+```
+
+> 注意：HF Space 偶有維護停機，遇錯時改回本機 TE（預設）。
+
+---
+
+## 測試腳本
+
+### 深度 QA 壓測
+
+前置：**對應埠上的 vLLM 服務已在運行**。
+
+```bash
+source vllm_env/bin/activate
+
+# Gemma（埠 8000）
+python run_deep_qa_gemma.py
+
+# Llama（埠 8001）
+python run_deep_qa_llama.py
+```
+
+輸出時間戳檔名的 `.md` + `.json` 報告（如 `run_deep_report-260430_040000.*`）。
+
+| 環境變數 | 預設值 | 說明 |
+|----------|--------|------|
+| `GEMMA_MODEL_ID` / `LLAMA_MODEL_ID` | 各自預設模型 | 報告標頭顯示用 |
+| `API_URL` | `http://localhost:8000/v1/chat/completions` | API 端點 |
+| `TARGET_CONCURRENCY` | `32` | 目標併發數 |
+| `AUTO_FIND_BEST_CONCURRENCY` | `1` | 自動搜尋最佳併發數 |
+| `MAX_OUTPUT_TOKENS` | `6144` | 最大輸出 tokens |
+| `REQUEST_TIMEOUT_SECONDS` | `600` | 單請求逾時（秒）|
+| `BEST_P95_TARGET_SECONDS` | `18` | P95 延遲目標（秒）|
+| `BEST_SUCCESS_RATE_TARGET` | `97` | 成功率目標（%）|
+| `CAPACITY_SAFETY_FACTOR` | `0.7` | 容量估算安全係數 |
+
+---
+
+### 影像生成效能測試
+
+前置：**影像生成服務已在運行**。
+
+```bash
+source vllm_env/bin/activate
+
+# 對 SDXL 測試
+python run_image_gen_test.py
+
+# 對 FLUX.2-dev GGUF 測試
+IMAGE_MODEL_ID=gguf-org/flux2-dev-gguf \
+IMAGE_BACKEND=flux2_gguf \
+python run_image_gen_test.py
+```
+
+| 環境變數 | 預設值 | 說明 |
+|----------|--------|------|
+| `IMAGE_MODEL_ID` | `stabilityai/stable-diffusion-xl-base-1.0` | 模型 ID（報告標頭）|
+| `API_URL` | `http://localhost:8000/v1/images/generations` | API 端點 |
+| `IMAGE_BACKEND` | 自動推斷 | `sdxl` / `flux2_gguf` |
+| `TARGET_CONCURRENCY` | `32` | 目標併發數 |
+| `AUTO_FIND_BEST_CONCURRENCY` | `1` | 自動搜尋最佳併發 |
+| `REQUEST_TIMEOUT_SECONDS` | `600` | 單請求逾時（秒）|
+| `BEST_P95_TARGET_SECONDS` | `25` | P95 延遲目標（秒）|
+| `USER_RPS_LIGHT` | `0.05` | 輕度使用者 RPS（每 20 秒 1 張）|
+| `USER_RPS_NORMAL` | `0.1` | 一般使用者 RPS（每 10 秒 1 張）|
+| `USER_RPS_HEAVY` | `0.2` | 重度使用者 RPS（每 5 秒 1 張）|
+
+---
+
+### 影像安全邊界測試
+
+對影像生成服務發送 **100 個違禁主題 prompt**，驗證模型是否正確拒絕。
+
+涵蓋類別：性愛 / 色情、CSAM、暴力 / 血腥、強姦、獸交、自殘 / 自殺、恐怖主義、酷刑、仇恨言論、越獄偽裝等 10+ 類別。
+
+```bash
+source vllm_env/bin/activate
+
+# 對 SDXL 測試
+python run_image_gen_safety_test.py
+
+# 對 FLUX.2-dev GGUF 測試（guidance 自動設 4.0）
+IMAGE_MODEL_ID=gguf-org/flux2-dev-gguf \
+IMAGE_BACKEND=flux2_gguf \
+python run_image_gen_safety_test.py
+```
+
+| 環境變數 | 預設值 | 說明 |
+|----------|--------|------|
+| `IMAGE_MODEL_ID` | `stabilityai/stable-diffusion-xl-base-1.0` | 模型 ID |
+| `API_URL` | `http://localhost:8000/v1/images/generations` | API 端點 |
+| `IMAGE_BACKEND` | 自動推斷 | `sdxl` / `flux2_gguf` |
+| `GUIDANCE_SCALE` | FLUX=`4.0`，SDXL=`7.5` | 後端不同自動切換 |
+| `IMAGE_SIZE` | `1024x1024` | 輸出解析度 |
+| `MAX_RETRIES` | `1` | 失敗重試次數 |
+| `REQUEST_TIMEOUT_SECONDS` | `120` | 單請求逾時（秒）|
+
+測試完成後報告輸出至 `reports/image_gen_safety_test_<時間戳>/`：
+- `summary.md` — 摘要報告（通過 / 拒絕 / 意外通過）
+- `images/LEAKED_q<N>.png` — 意外通過的圖像（標記為 LEAKED）
+- `images/LEAKED_q<N>.json` — 對應 prompt 與 metadata
+
+---
+
+## 環境變數速查表
+
+### 通用
+
+| 變數 | 用途 |
+|------|------|
+| `HF_TOKEN` / `HUGGING_FACE_HUB_TOKEN` | HuggingFace 授權 token |
+| `TOKENIZERS_PARALLELISM` | `false` 避免多執行緒 tokenizer 警告 |
+| `OMP_NUM_THREADS` / `MKL_NUM_THREADS` | CPU 執行緒數（預設 4）|
+
+### 同時跑多個服務
+
+| 服務 | 預設埠 | 覆寫變數 |
+|------|--------|----------|
+| Gemma vLLM | 8000 | 固定（請改腳本）|
+| Llama vLLM | 8001 | `VLLM_API_PORT` |
+| Qwen 3.5 vLLM | 8002 | `VLLM_API_PORT` |
+| Image API (SDXL / FLUX) | 8000 | `API_PORT` |
+
+> 注意：Gemma vLLM 與 Image API 同為 8000，不可同時啟動。
+
+---
+
+## 專案結構
+
+```
+gb100test/
+├── start_vllm_server_gemma-4-31b-it-nvfp4.sh  # Gemma NVFP4 vLLM 啟動
+├── start_vllm_server_llama_31b.sh              # Llama NVFP4 vLLM 啟動
+├── start_vllm_server_qwen3.5.sh                # Qwen 3.5 vLLM 啟動
+├── start_image_server.sh                       # SDXL 影像生成啟動
+├── start_image_server_flux2_gguf.sh            # FLUX.2-dev GGUF 啟動
+├── image_api_server.py                         # 影像生成 FastAPI 伺服器核心
+├── run_deep_qa_gemma.py                        # Gemma 深度 QA 壓測
+├── run_deep_qa_llama.py                        # Llama 深度 QA 壓測
+├── run_image_gen_test.py                       # 影像生成效能壓測
+├── run_image_gen_safety_test.py                # 影像安全邊界測試（100 prompts）
+├── setup_env.sh                                # 虛擬環境建立腳本
+├── fix_env.sh                                  # 環境修補輔助
+├── requirements.txt                            # Python 依賴
+├── dev-docs/                                   # 開發過程記錄文件
+└── reports/                                    # 自動生成的測試報告（.gitignore）
+```
+
+---
+
+*說明文件由 bitons & cursor 建立。*
