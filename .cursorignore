@@ -1,0 +1,2 @@
+# Python venv — exclude from Cursor codebase indexing
+vllm_env/
