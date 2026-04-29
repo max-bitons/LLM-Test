@@ -4,3 +4,6 @@ transformers
 accelerate
 huggingface_hub
 openai
+diffusers
+requests
+gguf

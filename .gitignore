@@ -66,3 +66,6 @@ huggingface/
 # Optional: local model / checkpoint dirs (uncomment if you store weights here)
 # models/
 # checkpoints/
+
+# Reports
+reports/
