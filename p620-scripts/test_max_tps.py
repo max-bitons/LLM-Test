@@ -1,6 +1,7 @@
 # 產能壓測。清單：llm_production_test_suite.py；SLO/混勻/soak：llm_production_harness.py
 import argparse
 import asyncio
+import ipaddress
 import math
 import aiohttp
 import time
@@ -10,6 +11,7 @@ import os
 import platform
 import subprocess
 import sys
+from urllib.parse import urlparse, urlunparse
 
 
 def get_system_info():
@@ -97,6 +99,7 @@ FALLBACK_MAX_MODEL_LEN = os.environ.get("VLLM_MAX_MODEL_LEN", "")
 # 請求 body 的 `model` 必須與服務端 served model id 一致。
 # 若在 CLI 省略 --model，將呼叫 GET /v1/models 自動選取（單一模型直接用；多模型互動選擇；無 TTY 時可用 VLLM_CHAT_MODEL）。
 # 以下初始值僅在套用 CLI 前占位；實際值於 main() 內解析後寫入。
+CHAT_MODEL = os.environ.get("VLLM_CHAT_MODEL", "") or "gemma-4-E2B-it-AWQ-4bit"
 # 對話 system：預設角色扮演（可環境變數 VLLM_SYSTEM_PROMPT 覆寫整段）
 _CHAT_SYS_ENV = os.environ.get("VLLM_SYSTEM_PROMPT", "").strip()
 CHAT_SYSTEM_PROMPT = _CHAT_SYS_ENV or (
@@ -113,6 +116,30 @@ URL = f"{_LLM_BASE}/v1/chat/completions"
 HEADERS = {"Content-Type": "application/json"}
 # 單一 HTTP 請求逾時（秒）；環境變數 LLM_HTTP_TIMEOUT 可覆寫，CLI --timeout 優先
 _HTTP_TIMEOUT = float(os.environ.get("LLM_HTTP_TIMEOUT", "0") or "0") or 3600.0
+
+
+def _apply_port_to_base_url(base_url: str, port: int) -> str:
+    """
+    將 -u／LLM_BASE_URL 中的主機與協定保留，僅替換埠號（產生無路徑的 API 根 URL）。
+    IPv6 位址會自動加上方括號。
+    """
+    raw = (base_url or "").strip().rstrip("/")
+    if not raw:
+        raw = "http://127.0.0.1"
+    if "://" not in raw:
+        raw = "http://" + raw.split("/")[0]
+    pu = urlparse(raw)
+    scheme = pu.scheme or "http"
+    host = pu.hostname or "127.0.0.1"
+    prt = int(port)
+    if prt < 1 or prt > 65535:
+        raise ValueError(f"埠號須介於 1–65535：{prt}")
+    try:
+        ipaddress.IPv6Address(host)
+        netloc = f"[{host}]:{prt}"
+    except ValueError:
+        netloc = f"{host}:{prt}"
+    return urlunparse((scheme, netloc, "", "", "", "")).rstrip("/")
 
 
 def _reports_max_tps_md_path() -> str:
@@ -134,6 +161,7 @@ def parse_cli(argv=None) -> argparse.Namespace:
         epilog=(
             "範例:\n"
             "  python p620-scripts/test_max_tps.py -u http://127.0.0.1:8002\n"
+            "  python p620-scripts/test_max_tps.py -p 8001\n"
             "  python p620-scripts/test_max_tps.py -u http://127.0.0.1:8800 -m gemma-4-E2B-it-AWQ-4bit\n"
             "  # 要提高併發（例如對照實驗）：\n"
             "  python p620-scripts/test_max_tps.py -u http://127.0.0.1:8002 -c 64\n"
@@ -146,6 +174,17 @@ def parse_cli(argv=None) -> argparse.Namespace:
         "-u",
         default=_LLM_BASE,
         help="API 根 URL（不含路徑），例如 http://127.0.0.1:8002；等同環境變數 LLM_BASE_URL",
+    )
+    p.add_argument(
+        "--port",
+        "-p",
+        type=int,
+        default=None,
+        metavar="PORT",
+        help=(
+            "僅覆寫 API 埠號；scheme 與主機仍來自 -u／LLM_BASE_URL（省略 -u 時沿用預設基底 URL 的主機）。"
+            "例：`-p 8001` 等同連 `http://127.0.0.1:8001`（在預設 -u 下）。"
+        ),
     )
     p.add_argument(
         "--model",
@@ -198,7 +237,14 @@ def apply_cli_to_globals(args: argparse.Namespace) -> None:
     global _LLM_BASE, URL, CHAT_MODEL, CONCURRENT_REQUESTS, MAX_TOKENS
     global SAMPLING_TEMPERATURE, SAMPLING_TOP_P, _HTTP_TIMEOUT
     global _MAX_TOKENS_SOURCE, _MAX_TOKENS_NOTE
-    _LLM_BASE = str(args.base_url).rstrip("/")
+    if args.port is not None:
+        try:
+            _LLM_BASE = _apply_port_to_base_url(str(args.base_url), args.port)
+        except ValueError as exc:
+            print(f"❌ --port／-p 無效: {exc}", file=sys.stderr)
+            sys.exit(2)
+    else:
+        _LLM_BASE = str(args.base_url).rstrip("/")
     URL = f"{_LLM_BASE}/v1/chat/completions"
     if args.model is not None:
         CHAT_MODEL = args.model
