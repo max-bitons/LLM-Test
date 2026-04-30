@@ -427,7 +427,7 @@ def percentile(values, pct):
 
 
 def build_latency_stats(results):
-    latencies = [r["latency"] for r in results if r["success"]]
+    latencies = [r["latency"] for r in results if r.get("latency") is not None]
     if not latencies:
         return {"avg": 0.0, "p50": 0.0, "p95": 0.0, "p99": 0.0, "min": 0.0, "max": 0.0, "std": 0.0}
     return {
