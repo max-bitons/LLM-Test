@@ -1,39 +1,44 @@
 #!/bin/bash
 
-echo "======================================"
-echo " 啟動 vLLM OpenAI 相容 API 伺服器（Qwen3.5-27B NVFP4 + TurboQuant）"
-echo "======================================"
-echo " 預設模型: kaitchup/Qwen3.5-27B-NVFP4"
-echo " 目標: 32K 長文 | FP4 精度 | 多併發優化"
-echo " 模型量化: NVFP4（compressed-tensors，vLLM 自動偵測）"
-echo " KV Cache: fp8（Qwen3.5 為 Attention+Mamba 混合架構，TurboQuant 不支援混合模型）"
-echo "   預設: fp8（~2x KV 壓縮，混合模型完全相容）"
-echo "   覆寫: export KV_CACHE_DTYPE=fp8_per_token_head | int8_per_token_head | auto"
-echo "   [說明] TurboQuant 僅支援純 Attention 架構（如 Qwen3-32B / Llama）"
-echo "          若改用純 Attention 模型可設 KV_CACHE_DTYPE=turboquant_k8v4"
-echo " 需求: vLLM >= 0.20.0 | GB100/H100/Blackwell/Hopper GPU"
-echo " 覆寫模型:  export QWEN_MODEL_ID=<model_id>"
-echo " 備選模型:  RedHatAI/Qwen3-32B-NVFP4（純 Attention，可用 TurboQuant）"
-echo "======================================"
+# 易讀的終端區塊（僅 ANSI 無色彩，適合紀錄重導）
+vllm_print_title() {
+    printf '\n'
+    printf '┌──────────────────────────────────────────────────────────────┐\n'
+    printf '│ %-60s │\n' "$1"
+    printf '└──────────────────────────────────────────────────────────────┘\n'
+}
+
+vllm_print_section() {
+    printf '\n── %s ──\n' "$1"
+}
+
+vllm_print_kv() {
+    printf '  %-26s %s\n' "$1" "$2"
+}
+
+vllm_print_title "vLLM OpenAI API｜Qwen3.5 NVFP4（TurboQuant 依模型）"
 
 source vllm_env/bin/activate
 
 export TOKENIZERS_PARALLELISM=${TOKENIZERS_PARALLELISM:-false}
 if [ -z "${OMP_NUM_THREADS+x}" ]; then
-    export OMP_NUM_THREADS=4
-    export MKL_NUM_THREADS=4
+    export OMP_NUM_THREADS=8
+    export MKL_NUM_THREADS=8
 fi
 
 # --- 模型設定 ---
-# kaitchup/Qwen3.5-27B-NVFP4：27B 參數，NVFP4 精度，~19GB 載入大小
-# 量化格式由 compressed-tensors config 自動偵測，無需 --quantization 旗標
-MODEL_ID=${QWEN_MODEL_ID:-"kaitchup/Qwen3.5-27B-NVFP4"}
+# apolo13x/Qwen3.5-9B-NVFP4：9B NVFP4（混合 Attention+Mamba／線性注意力），compressed-tensors 自動偵測
+MODEL_ID=${QWEN_MODEL_ID:-"apolo13x/Qwen3.5-9B-NVFP4"}
 
 # --- 服務埠（與 Llama 腳本分開） ---
 VLLM_API_PORT=${VLLM_API_PORT:-8002}
 
-# --- 記憶體：NVFP4 大幅省顯存，可提高至 0.92 ---
-GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.90}
+# --- gpu-memory-utilization（vLLM --gpu-memory-utilization）---
+# 本平台為 aarch64（ARM），且為 GPU／CPU Unified / Share memory 架構：
+# VRAM 與系統 RAM 共用同一池時，將 gpu_memory_utilization 調得過高（貼近 1.0）容易
+# 擠爆整體可用記憶體，造成換頁、I/O 風暴或系統鎖死。預設 0.75 保留緩衝；專機可再視
+# 穩定度調高（export GPU_MEMORY_UTILIZATION），仍不建議在未監控情況下長期滿載。
+GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.75}
 
 # --- 32K 長文上下文目標 ---
 MAX_MODEL_LEN=${VLLM_MAX_MODEL_LEN:-32768}
@@ -42,28 +47,28 @@ MAX_MODEL_LEN=${VLLM_MAX_MODEL_LEN:-32768}
 # chunked-prefill 開啟後此值為每個調度步驟的 token 上限
 MAX_NUM_BATCHED_TOKENS=${VLLM_MAX_NUM_BATCHED_TOKENS:-32768}
 
-# --- 最大並發請求數：GB100 顯存充足，設 32 支援高併發 ---
+# --- 最大並發請求數 ---
+# 與 KV／批次共用同一資源上限；於 ARM 統一／共享記憶體環境下，過高併發會放大壓力，可視穩定性調降。
 MAX_NUM_SEQS=${VLLM_MAX_NUM_SEQS:-32}
 
-# --- KV Cache 壓縮 ---
-# Qwen3.5 架構為 Attention + Mamba/SSM 混合模型（Qwen3_5ForConditionalGeneration）
-# TurboQuant 不支援混合模型（需要全部為 Attention 層）→ 改用 fp8 KV cache
-#
-# 可選值（來自 vLLM 0.20 --kv-cache-dtype）：
-#   fp8 / fp8_e4m3     : FP8 KV cache，~2x 壓縮，混合模型完全相容 ← 預設
-#   fp8_per_token_head : 更細粒度的 per-token/head FP8
-#   int8_per_token_head: INT8 per-token/head
-#   auto               : 不壓縮（FP16/BF16 原始 KV cache）
-#
-# TurboQuant 系列（turboquant_k8v4 等）：
-#   僅支援純 Attention 模型（如 Qwen3-32B、Llama 等），Qwen3.5 不適用
-#
-# QJL 說明：vLLM 官方刻意不納入 QJL 殘差校正（5+ 獨立團隊實測發現透過 softmax 放大方差）
-#           TurboQuant 改用 WHT 旋轉，但 Qwen3.5 混合架構下兩者均不適用
-KV_CACHE_DTYPE=${KV_CACHE_DTYPE:-"fp8"}
+# --- KV Cache：TurboQuant 僅適用純 Attention；Qwen3.5/3.6 混合模型由 vLLM 拒絕 turboquant_* ---
+# 未設定 KV_CACHE_DTYPE 時依 MODEL_ID 自動選擇：
+#   *Qwen3.5* / *Qwen3_5* / *Qwen3.6* / *Qwen3_6* → auto（保守，NVFP4 亦避免強開 fp8 KV 損壞）
+#   其餘（如 RedHatAI/Qwen3-32B-NVFP4）→ turboquant_k8v4
+_default_kv_for_model() {
+    case "$MODEL_ID" in
+        *[Qq]wen3.5*|[Qq]wen3_5*|[Qq]wen3.6*|[Qq]wen3_6*) echo auto ;;
+        *) echo turboquant_k8v4 ;;
+    esac
+}
+KV_CACHE_DTYPE=${KV_CACHE_DTYPE:-$(_default_kv_for_model)}
 
-# TQ_SKIP_LAYERS 僅對 TurboQuant 有效，fp8 模式下忽略
-TQ_SKIP_LAYERS=${TQ_SKIP_LAYERS:-"0"}
+# 邊界層 skip 僅對 turboquant_* 有意義；其他 dtype 預設 0 以免多餘旗標
+if [[ "$KV_CACHE_DTYPE" == turboquant* ]]; then
+    TQ_SKIP_LAYERS=${TQ_SKIP_LAYERS:-1}
+else
+    TQ_SKIP_LAYERS=${TQ_SKIP_LAYERS:-0}
+fi
 
 # --- 其他設定 ---
 VLLM_SWAP_SPACE=${VLLM_SWAP_SPACE:-0}
@@ -72,18 +77,67 @@ VLLM_MM_PROCESSOR_CACHE_GB=${VLLM_MM_PROCESSOR_CACHE_GB:-1}
 ENABLE_PREFIX_CACHING=${ENABLE_PREFIX_CACHING:-1}
 EXTRA_VLLM_ARGS=${EXTRA_VLLM_ARGS:-""}
 
-# NVFP4 模型 dtype 設 bfloat16（計算 dtype），權重由 compressed-tensors 處理
+# --- 吞吐相關（可 export 覆寫）---
+# Dual batch overlap（--enable-dbo）：vLLM 0.20 要求 microbatch 搭配 DeepEP all2all
+# （deepep_low_latency／deepep_high_throughput）；一般用 allgather_reducescatter 會直接驗證失敗。
+# 預設關閉；若已裝 DeepEP 並設定 --all2all-backend，可自行 VLLM_ENABLE_DBO=1。
+VLLM_ENABLE_DBO=${VLLM_ENABLE_DBO:-0}
+# 串流：預設不傳（維持 vLLM 預設 1）；設為 4–10 可減少 host 端開銷，略增整體吞吐（串流顆粒度變粗）
+VLLM_STREAM_INTERVAL=${VLLM_STREAM_INTERVAL:-}
+# 覆寫 attention backend 時使用，例如：FLASH_ATTN（留空＝自動選擇）
+VLLM_ATTENTION_BACKEND=${VLLM_ATTENTION_BACKEND:-}
+
+# NVFP4 權重 + bfloat16 計算 dtype（由 compressed-tensors 負責權重精度）
 VLLM_DTYPE=${VLLM_DTYPE:-bfloat16}
-# 明確設為空字串：量化格式由模型 config 自動偵測，不需手動指定
+# 量化：標準 HF 模型留空（自動偵測）；NVFP4 量化模型也留空由 config 處理
 VLLM_QUANTIZATION=${VLLM_QUANTIZATION:-""}
 
 VLLM_VERSION=$(python -c "import vllm; print(getattr(vllm, '__version__', 'unknown'))" 2>/dev/null || echo "unknown")
 
-echo "模型: $MODEL_ID | vLLM: $VLLM_VERSION"
-echo "http://0.0.0.0:$VLLM_API_PORT/v1 | max-model-len=$MAX_MODEL_LEN batched-tokens=$MAX_NUM_BATCHED_TOKENS max-seqs=$MAX_NUM_SEQS"
-echo "gpu-mem-util=$GPU_MEMORY_UTILIZATION swap-space(GB)=$VLLM_SWAP_SPACE prefix-cache=$ENABLE_PREFIX_CACHING"
-echo "dtype=$VLLM_DTYPE | 模型量化=auto(NVFP4) | kv-cache-dtype=$KV_CACHE_DTYPE skip-layers=$TQ_SKIP_LAYERS"
-echo "======================================"
+vllm_print_section "環境與模型"
+vllm_print_kv "Python vLLM" "$VLLM_VERSION"
+vllm_print_kv "建議環境" "vLLM >= 0.20.0 ； GB100／H100／Blackwell／Hopper"
+vllm_print_kv "模型 ID" "$MODEL_ID"
+vllm_print_kv "覆寫模型" "export QWEN_MODEL_ID=<HF id>"
+
+vllm_print_section "監聽與端點"
+vllm_print_kv "連線基底" "http://0.0.0.0:${VLLM_API_PORT}/v1"
+vllm_print_kv "健全檢查" "http://0.0.0.0:${VLLM_API_PORT}/v1/models"
+
+vllm_print_section "上下文與批次"
+vllm_print_kv "max-model-len" "$MAX_MODEL_LEN"
+vllm_print_kv "max-num-batched-tokens" "$MAX_NUM_BATCHED_TOKENS"
+vllm_print_kv "max-num-seqs" "$MAX_NUM_SEQS"
+echo "    提示｜ chunked-prefill／實際傳入的旗標請看下方「啟動前檢查」。"
+
+vllm_print_section "記憶體與資料型別"
+vllm_print_kv "gpu-memory-utilization" "$GPU_MEMORY_UTILIZATION（ARM 統一／共享記憶體：預設保守，避免佔滿導致鎖死）"
+vllm_print_kv "swap-space (GB)" "$VLLM_SWAP_SPACE"
+vllm_print_kv "計算 dtype" "$VLLM_DTYPE（NVFP4 權重由模型 config 自動偵測）"
+vllm_print_kv "mm-processor-cache-gb" "$VLLM_MM_PROCESSOR_CACHE_GB"
+
+vllm_print_section "KV 與 TurboQuant"
+vllm_print_kv "kv-cache-dtype" "$KV_CACHE_DTYPE"
+vllm_print_kv "turboquant skip-layers" "$TQ_SKIP_LAYERS（僅 turboquant_* 時有效）"
+echo "    註｜ Qwen3.5/3.6 混合架構不可用 turboquant_*，將維持 auto。"
+echo "    註｜ 純 Attention NVFP4（例如 RedHatAI Qwen3-32B）預設 turboquant_k8v4，可用 KV_CACHE_DTYPE 覆寫。"
+
+vllm_print_section "吞吐相關（環境變數可覆寫）"
+dbo_state="關閉（預設，避免無 DeepEP 時驗證失敗）"
+if [ "$VLLM_ENABLE_DBO" = "1" ]; then
+    dbo_state="啟用 --enable-dbo（須相容 all2all／DeepEP）"
+fi
+vllm_print_kv "VLLM_ENABLE_DBO" "$dbo_state"
+stream_iv="${VLLM_STREAM_INTERVAL:-（未設定＝伺服器預設 1）}"
+vllm_print_kv "VLLM_STREAM_INTERVAL" "$stream_iv"
+vllm_print_kv "VLLM_ATTENTION_BACKEND" "${VLLM_ATTENTION_BACKEND:-（未設定＝自動）}"
+echo "    調整請設 GPU_MEMORY_UTILIZATION（統一／共享記憶體勿過高；可試 0.65～0.80）"
+
+vllm_print_section "常用環境變數速查"
+echo "  GPU_MEMORY_UTILIZATION VLLM_MAX_MODEL_LEN VLLM_MAX_NUM_SEQS"
+echo "  KV_CACHE_DTYPE EXTRA_VLLM_ARGS VLLM_STREAM_INTERVAL"
+
+printf '\n'
 
 API_SERVER_HELP=$(python -m vllm.entrypoints.openai.api_server --help 2>&1 || true)
 has_api_flag() {
@@ -119,6 +173,30 @@ if has_api_flag "--enable-chunked-prefill"; then
     CHUNKED_PREFILL_FLAG="--enable-chunked-prefill"
 fi
 
+# Async scheduling（V1）：降低 GPU 空檔 → 吞吐與延遲較佳
+ASYNC_SCHED_FLAG=""
+if has_api_flag "--async-scheduling"; then
+    ASYNC_SCHED_FLAG="--async-scheduling"
+fi
+
+# Dual batch overlap：見上方 VLLM_ENABLE_DBO 註解（預設關）
+DBO_FLAG=""
+if [ "$VLLM_ENABLE_DBO" = "1" ] && has_api_flag "--enable-dbo"; then
+    DBO_FLAG="--enable-dbo"
+fi
+
+# 串流：較大的 interval 減少 SSE／主機開銷，GPU 側不變但整體更省 CPU
+STREAM_INTERVAL_FLAG=""
+if [ -n "${VLLM_STREAM_INTERVAL}" ] && has_api_flag "--stream-interval"; then
+    STREAM_INTERVAL_FLAG="--stream-interval $VLLM_STREAM_INTERVAL"
+fi
+
+# Attention backend 覆寫（留空則自動；若自動偏保守可試 FLASH_ATTN 等）
+ATTENTION_BACKEND_FLAG=""
+if [ -n "$VLLM_ATTENTION_BACKEND" ] && has_api_flag "--attention-backend"; then
+    ATTENTION_BACKEND_FLAG="--attention-backend $VLLM_ATTENTION_BACKEND"
+fi
+
 # Qwen3.5-27B 為純文字模型，不設 --limit-mm-per-prompt（避免 vLLM 0.20+ JSON 格式衝突）
 LIMIT_MM_FLAG=""
 
@@ -148,20 +226,63 @@ KV_CACHE_FLAG=""
 KV_SKIP_LAYERS_FLAG=""
 if has_api_flag "--kv-cache-dtype"; then
     KV_CACHE_FLAG="--kv-cache-dtype $KV_CACHE_DTYPE"
-    if [ -n "$TQ_SKIP_LAYERS" ] && [ "$TQ_SKIP_LAYERS" != "0" ] && has_api_flag "--kv-cache-dtype-skip-layers"; then
+    if [[ "$KV_CACHE_DTYPE" == turboquant* ]] && [ -n "$TQ_SKIP_LAYERS" ] && [ "$TQ_SKIP_LAYERS" != "0" ] && has_api_flag "--kv-cache-dtype-skip-layers"; then
         KV_SKIP_LAYERS_FLAG="--kv-cache-dtype-skip-layers $TQ_SKIP_LAYERS"
     fi
-    echo "[INFO] TurboQuant KV Cache: $KV_CACHE_DTYPE (skip-layers=$TQ_SKIP_LAYERS)"
+    printf '\n[INFO] 將傳入 --kv-cache-dtype %s （skip-layers=%s）\n' "$KV_CACHE_DTYPE" "$TQ_SKIP_LAYERS"
 else
-    echo "[WARN] 此 vLLM 版本不支援 --kv-cache-dtype，需要 nightly >= 2026-04-15"
-    echo "       安裝指令: uv pip install vllm --pre --extra-index-url https://wheels.vllm.ai/nightly"
+    printf '\n[WARN] 此 vLLM 版本的 api_server --help 未出現 --kv-cache-dtype，略過 KV dtype 旗標。\n'
 fi
 
+if [ "$VLLM_ENABLE_DBO" = "1" ] && ! has_api_flag "--enable-dbo"; then
+    printf '[WARN] 已設 VLLM_ENABLE_DBO=1 ，但 api_server --help 未列出 --enable-dbo；略過 dbo。\n'
+fi
+
+vllm_print_section "啟動前檢查"
+if [ -n "$PREFIX_CACHE_FLAG" ]; then
+    vllm_print_kv "prefix-caching" "將傳入 --enable-prefix-caching"
+elif [ "${ENABLE_PREFIX_CACHING:-0}" = "1" ]; then
+    vllm_print_kv "prefix-caching" "[WARN] 已開啟但 CLI 無對應旗標，沿用引擎預設"
+else
+    vllm_print_kv "prefix-caching" "關閉"
+fi
+
+if [ -n "$CHUNKED_PREFILL_FLAG" ]; then
+    vllm_print_kv "chunked-prefill" "將傳入 --enable-chunked-prefill"
+elif has_api_flag "--enable-chunked-prefill"; then
+    vllm_print_kv "chunked-prefill" "[未傳旗標／使用預設]"
+else
+    vllm_print_kv "chunked-prefill" "（此版本的 --help 未列出選項）"
+fi
 if [ -z "$LOG_REQUEST_FLAG" ]; then
-    echo "[WARN] 未偵測到關閉 request log 的旗標，使用 vLLM 預設。"
+    printf '  %-26s %s\n' "request logging" "[WARN] 未偵測到停用旗標；保留 vLLM 預設（日誌可能較多）。"
+else
+    vllm_print_kv "request logging" "已套用 $LOG_REQUEST_FLAG"
 fi
 
-echo "以前景啟動（載入完成後可查 http://0.0.0.0:$VLLM_API_PORT/v1/models；Ctrl+C 結束）"
+if [ -n "$ASYNC_SCHED_FLAG" ]; then
+    vllm_print_kv "async-scheduling" "已加入（CLI 支援）"
+else
+    vllm_print_kv "async-scheduling" "（此版本未偵測到旗標，使用引擎預設）"
+fi
+
+if [ -n "$DBO_FLAG" ]; then
+    vllm_print_kv "dual-batch-overlap" "已加入 --enable-dbo"
+else
+    vllm_print_kv "dual-batch-overlap" "[關閉] 標準部署；若設 VLLM_ENABLE_DBO=1 請確認 DeepEP + all2all。"
+fi
+
+if [ -n "$STREAM_INTERVAL_FLAG" ]; then
+    vllm_print_kv "stream-interval" "已設定為 $VLLM_STREAM_INTERVAL"
+fi
+
+API_BASE_HINT="http://0.0.0.0:$VLLM_API_PORT/v1/models"
+printf '\n'
+printf '%s\n' "▶ 以前景模式啟動；載入完成後可開："
+printf '%s\n' "  $API_BASE_HINT"
+printf '%s\n' "  Ctrl+C 結束。若 OOM：先降 GPU_MEMORY_UTILIZATION（統一／共享記憶體尤甚）或 MAX_MODEL_LEN。"
+printf '\n'
+
 exec python -m vllm.entrypoints.openai.api_server \
     --model "$MODEL_ID" \
     --dtype "$VLLM_DTYPE" \
@@ -176,6 +297,10 @@ exec python -m vllm.entrypoints.openai.api_server \
     $MM_CACHE_FLAG \
     $PREFIX_CACHE_FLAG \
     $CHUNKED_PREFILL_FLAG \
+    $ASYNC_SCHED_FLAG \
+    $DBO_FLAG \
+    $STREAM_INTERVAL_FLAG \
+    $ATTENTION_BACKEND_FLAG \
     $LIMIT_MM_FLAG \
     $TOOL_CALL_FLAG \
     $REASONING_PARSER_FLAG \

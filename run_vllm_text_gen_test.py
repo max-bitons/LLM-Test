@@ -12,6 +12,11 @@ vLLM 文字生成壓力測試腳本
   - Max model len: 32768
   - Max num seqs: 32
 
+記憶體注意（請與啟動腳本對齊）：
+  - 靶機為 ARM（aarch64）且常見 GPU／CPU Unified 或共用系統記憶體；vLLM 的 gpu_memory_utilization
+    若設過高會與 OS／其他程式爭搶同一記憶體池，易導致嚴重卡頓甚至整機鎖死。
+  - 請在 start_vllm_server_qwen3.5.sh 維持保守預設（例如 0.75），必要時再單獨調高並觀察穩定性。
+
 create by : bitons & cursor
 """
 
@@ -216,6 +221,9 @@ async def probe_openai_compatible_models(
             out = {"url": url, "http_status": resp.status, "ok": True, "raw": data}
             models = data.get("data") if isinstance(data, dict) else None
             if isinstance(models, list) and models:
+                out["all_model_ids"] = [
+                    m.get("id") for m in models if isinstance(m, dict) and m.get("id")
+                ]
                 first = models[0]
                 if isinstance(first, dict):
                     out["primary_model_id"] = first.get("id")
@@ -647,174 +655,282 @@ def generate_markdown_report(
     startup_script = lbl.get("startup_script", "start_vllm_server_qwen3.5.sh")
     server_port = lbl.get("server_port", "8002")
 
+    all_results = concurrency_results + max_token_sweep_results
+    success_count_all = sum(1 for r in all_results if r["success"])
+    grade = evaluation["grade"]
+    score = evaluation["score"]
+    success_rate = evaluation["success_rate"]
+    users = capacity_estimate["estimated_concurrent_users"]
+    assumptions = capacity_estimate["assumptions"]
+    thresholds = concurrency_recommendation["thresholds"]
+    cc = model_service.get("client_config", {})
+    rd_cfg = cc.get("request_defaults", {})
+    probe = model_service.get("api_v1_models_probe", {})
+
+    grade_emoji = {"A+": "🥇", "A": "🥈", "B": "🥉", "C": "⚠️", "D": "🚨"}.get(grade, "📊")
+
+    # ── 標題 ──────────────────────────────────────────────────────
     md = f"# {suite} 壓力測試報告\n\n"
     md += "> **create by : bitons & cursor**\n\n"
-    md += f"**測試時間**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+    md += (
+        f"**測試時間**：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}　"
+        f"**模型**：`{cc.get('model_id', '—')}`　"
+        f"**服務埠**：{server_port}\n\n"
+    )
     md += "---\n\n"
 
-    # ── 模型與服務設定 ────────────────────────────────────────────
-    md += "## 模型與 vLLM 服務設定\n\n"
-    md += "| 欄位 | 數值 |\n|---|---|\n"
-    cc = model_service.get("client_config", {})
-    md += f"| 模型 ID | `{cc.get('model_id', '—')}` |\n"
-    md += f"| API Base URL | `{cc.get('api_base_url', '—')}` |\n"
-    md += f"| Chat API | `{cc.get('chat_api_url', '—')}` |\n"
-    rd = cc.get("request_defaults", {})
-    md += f"| 預設 max_tokens | {rd.get('max_tokens', '—')} |\n"
-    md += f"| temperature | {rd.get('temperature', '—')} |\n"
-    md += f"| top_p | {rd.get('top_p', '—')} |\n"
-    md += f"| 串流模式 (Streaming) | {'✅ 開啟（量測 TTFT）' if rd.get('stream') else '❌ 關閉'} |\n"
-    md += f"| 建議啟動腳本 | `{startup_script}` |\n"
-    md += f"| 服務埠 | {server_port} |\n"
+    # ══════════════════════════════════════════════════════════════
+    # 🏆 速覽摘要
+    # ══════════════════════════════════════════════════════════════
+    md += "## 🏆 測試結果速覽\n\n"
+    md += "> 以下是本次測試最關鍵的幾個數字，一眼就能判斷系統是否達標。\n\n"
 
-    probe = model_service.get("api_v1_models_probe", {})
-    md += "\n### API `GET /v1/models` 探測結果\n\n"
+    # 評等醒目區塊
+    md += f"### {grade_emoji} 綜合評等：**{grade}**（{score} / 100 分）\n\n"
+    md += f"> **{evaluation['comment']}**\n\n"
+
+    # 核心指標速覽表（技術術語 + 一般說明欄）
+    md += "| 指標（技術名稱） | **數值** | 白話說明 |\n"
+    md += "|---|:---:|---|\n"
+    sr_icon = "✅" if success_rate >= 95 else ("⚠️" if success_rate >= 80 else "❌")
+    md += (
+        f"| 成功率 | **{sr_icon} {success_rate:.1f}%** "
+        f"| 所有請求中正常回應的比例（建議 ≥ 95%） |\n"
+    )
+    avg_icon = "✅" if latency_stats["avg"] <= 30 else ("⚠️" if latency_stats["avg"] <= 60 else "🐢")
+    md += (
+        f"| 平均延遲 (Latency) | **{avg_icon} {latency_stats['avg']:.1f} 秒** "
+        f"| 平均等待模型完整回答所需時間 |\n"
+    )
+    p95_icon = "✅" if latency_stats["p95"] <= thresholds["p95_latency_seconds"] else "⚠️"
+    md += (
+        f"| P95 延遲 | **{p95_icon} {latency_stats['p95']:.1f} 秒** "
+        f"| 95% 的請求都在此時間內完成（門檻 ≤ {thresholds['p95_latency_seconds']:.0f} 秒） |\n"
+    )
+    tps_icon = "✅" if tps_stats["avg_tps"] >= 200 else ("⚠️" if tps_stats["avg_tps"] >= 50 else "🐢")
+    md += (
+        f"| 每秒字數 TPS (Tokens/s) | **{tps_icon} {tps_stats['avg_tps']:.0f} tok/s** "
+        f"| 模型每秒輸出的字詞數，越高回答越流暢快速 |\n"
+    )
+    if tps_stats.get("avg_ttft") is not None:
+        ttft_icon = "✅" if tps_stats["avg_ttft"] <= 2 else ("⚠️" if tps_stats["avg_ttft"] <= 5 else "🐢")
+        md += (
+            f"| 首字等待 TTFT (Time To First Token) | **{ttft_icon} {tps_stats['avg_ttft']:.2f} 秒** "
+            f"| 送出問題後，看到第一個字出現的等待時間 |\n"
+        )
+    rps_icon = "✅" if rps >= 1.0 else "⚠️"
+    md += (
+        f"| 吞吐量 RPS (Requests/s) | **{rps_icon} {rps:.3f} 次/秒** "
+        f"| 系統每秒能同時處理的完整對話請求數 |\n"
+    )
+    rec_con = concurrency_recommendation["recommended_concurrency"]
+    md += (
+        f"| 建議最大同時連線數 (Concurrency) | **🎯 {rec_con}** "
+        f"| 在品質達標前提下，建議的最大同時請求數 |\n"
+    )
+    md += "\n"
+
+    # 容量一句話
+    md += (
+        f"> 💡 **容量估算**（安全係數 {capacity_estimate['safety_factor']}）："
+        f"一般情境下（每人約 10 秒問一次）可支援約 **{users['normal']} 人**同時上線；"
+        f"輕量情境（約 30 秒一次）可達 **{users['light']} 人**。\n\n"
+    )
+    md += "---\n\n"
+
+    # ══════════════════════════════════════════════════════════════
+    # 📋 服務設定
+    # ══════════════════════════════════════════════════════════════
+    md += "## 📋 服務設定\n\n"
+    md += "| 欄位 | 數值 |\n|---|---|\n"
+    md += f"| 模型 ID | `{cc.get('model_id', '—')}` |\n"
+    md += f"| API 端點 | `{cc.get('chat_api_url', '—')}` |\n"
+    md += f"| 預設最大輸出 (max_tokens) | {rd_cfg.get('max_tokens', '—')} 個 token |\n"
+    md += f"| 隨機性 (temperature) | {rd_cfg.get('temperature', '—')}（0=固定，1=隨機） |\n"
+    md += f"| 採樣範圍 (top_p) | {rd_cfg.get('top_p', '—')} |\n"
+    md += (
+        f"| 串流輸出 (Streaming) | "
+        f"{'✅ 開啟（逐字輸出，可量測首字等待 TTFT）' if rd_cfg.get('stream') else '❌ 關閉（等全部產完才回傳）'} |\n"
+    )
+    md += f"| 啟動腳本 | `{startup_script}` |\n"
+
     if probe and probe.get("ok"):
-        md += f"- **URL**: `{probe.get('url')}`\n"
-        md += f"- **HTTP**: {probe.get('http_status')}\n"
-        md += f"- **服務回報模型 id**: `{probe.get('primary_model_id', '—')}`\n"
-        md += f"- **owned_by**: `{probe.get('primary_owned_by', '—')}`\n"
+        md += f"\n> 🔍 伺服器確認模型：`{probe.get('primary_model_id', '—')}`（HTTP {probe.get('http_status')}）\n\n"
     else:
         md += (
-            f"- **狀態**: 無法取得（HTTP {probe.get('http_status', '—')}），"
-            f"請確認伺服器是否已啟動在 port {server_port}。\n"
+            f"\n> ⚠️ 無法取得 `/v1/models`（HTTP {probe.get('http_status', '—')}），"
+            f"請確認伺服器是否已啟動在 port {server_port}。\n\n"
         )
-        if probe and probe.get("exception"):
-            md += f"- **例外**: `{probe['exception']}`\n"
 
-    # ── 主機環境 ──────────────────────────────────────────────────
-    md += "\n## 🖥️ 主機環境參數\n\n"
-    md += "| 參數名稱 | 數值 |\n|---|---|\n"
+    # ══════════════════════════════════════════════════════════════
+    # 🖥️ 主機環境
+    # ══════════════════════════════════════════════════════════════
+    md += "## 🖥️ 主機環境\n\n"
+    md += "| 項目 | 數值 |\n|---|---|\n"
     md += f"| 作業系統 | {env_info.get('os_platform')} |\n"
     md += f"| Python 版本 | {env_info.get('python_version')} |\n"
-    md += f"| CPU | {env_info.get('cpu')} |\n"
-    md += f"| CPU 核心數 | {env_info.get('physical_cpu_cores')} (實體) / {env_info.get('logical_cpu_cores')} (邏輯) |\n"
-    md += f"| 總記憶體 | {env_info.get('total_ram_gb')} GB |\n"
+    md += f"| CPU 架構 | {env_info.get('cpu')} |\n"
+    md += f"| CPU 核心數 | {env_info.get('physical_cpu_cores')} 實體 / {env_info.get('logical_cpu_cores')} 邏輯 |\n"
+    md += f"| 系統記憶體 (RAM) | {env_info.get('total_ram_gb')} GB |\n"
     if "cuda_version" in env_info:
-        md += f"| CUDA 版本 | {env_info['cuda_version']} |\n"
+        md += f"| CUDA 版本（GPU 驅動介面）| {env_info['cuda_version']} |\n"
     for gpu in env_info.get("gpus", []):
-        md += f"| GPU {gpu['gpu_id']} | {gpu['name']} (VRAM: {gpu['vram_gb']} GB) |\n"
+        md += f"| GPU {gpu['gpu_id']}（顯示卡）| {gpu['name']}（視訊記憶體 VRAM：{gpu['vram_gb']} GB）|\n"
+    md += "\n"
 
-    # ── 整體效能統計 ──────────────────────────────────────────────
-    all_results = concurrency_results + max_token_sweep_results
-    success_count = sum(1 for r in all_results if r["success"])
-    md += "\n## ⚡ 整體效能統計\n\n"
-    md += f"- **總請求數**: {len(all_results)} (併發測試: {len(concurrency_results)} + Token Sweep: {len(max_token_sweep_results)})\n"
-    md += f"- **成功請求數**: {success_count}\n"
-    md += f"- **總花費時間**: {total_time:.2f} 秒\n"
-    md += f"- **整體 RPS**: {rps:.3f} 次/秒\n"
+    # ══════════════════════════════════════════════════════════════
+    # ⚡ 詳細效能數據
+    # ══════════════════════════════════════════════════════════════
+    md += "## ⚡ 詳細效能數據\n\n"
+    md += (
+        f"- **總請求數**：{len(all_results)} 筆（併發壓測：{len(concurrency_results)} 筆"
+        f"＋最大長度測試：{len(max_token_sweep_results)} 筆）\n"
+        f"- **成功**：{success_count_all} 筆　**失敗**：{len(all_results) - success_count_all} 筆\n"
+        f"- **測試總耗時**：{total_time:.1f} 秒\n\n"
+    )
 
-    md += "\n### ⏱️ 延遲統計（Concurrency Sweep 基準）\n\n"
-    md += f"| 指標 | 數值 |\n|---|---|\n"
-    md += f"| 平均延遲 | {latency_stats['avg']:.2f} 秒 |\n"
-    md += f"| P50 延遲 | {latency_stats['p50']:.2f} 秒 |\n"
-    md += f"| P95 延遲 | {latency_stats['p95']:.2f} 秒 |\n"
-    md += f"| P99 延遲 | {latency_stats['p99']:.2f} 秒 |\n"
-    md += f"| 最小延遲 | {latency_stats['min']:.2f} 秒 |\n"
-    md += f"| 最大延遲 | {latency_stats['max']:.2f} 秒 |\n"
-    md += f"| 標準差 | {latency_stats['std']:.2f} 秒 |\n"
+    # 延遲統計
+    md += "### ⏱️ 延遲統計（Latency）— 等待回答的時間\n\n"
+    md += "> **延遲（Latency）**：從送出問題到收到完整回答的等待秒數。越低代表回應越快。\n\n"
+    md += "| 指標 | **數值** | 說明 |\n|---|:---:|---|\n"
+    md += f"| 平均延遲 | **{latency_stats['avg']:.2f} 秒** | 所有請求的平均等待時間 |\n"
+    md += f"| P50 中位數 | **{latency_stats['p50']:.2f} 秒** | 有一半的請求比這個快 |\n"
+    md += f"| **P95 延遲** | **{latency_stats['p95']:.2f} 秒** | **95% 的請求都在此時間內完成**（關鍵指標） |\n"
+    md += f"| P99 延遲 | {latency_stats['p99']:.2f} 秒 | 99% 的請求完成時間（含偶發慢請求） |\n"
+    md += f"| 最快 | {latency_stats['min']:.2f} 秒 | 本次測試最短的一次回應 |\n"
+    md += f"| 最慢 | {latency_stats['max']:.2f} 秒 | 本次測試最長的一次回應 |\n"
+    md += f"| 標準差 | {latency_stats['std']:.2f} 秒 | 回應時間的穩定程度（越小越穩定） |\n\n"
 
-    md += "\n### 🔤 Token 吞吐量統計\n\n"
-    md += f"| 指標 | 數值 |\n|---|---|\n"
-    md += f"| 平均 TPS (tokens/秒) | {tps_stats['avg_tps']:.1f} |\n"
-    md += f"| P50 TPS | {tps_stats['p50_tps']:.1f} |\n"
-    md += f"| P95 TPS | {tps_stats['p95_tps']:.1f} |\n"
-    md += f"| 最高 TPS | {tps_stats['max_tps']:.1f} |\n"
+    # TPS 統計
+    md += "### 🔤 字數吞吐量（TPS / Tokens Per Second）— 模型輸出速度\n\n"
+    md += "> **TPS（Tokens Per Second，每秒字數）**：模型每秒能輸出幾個 token（大約等於一個中文字或半個英文單字）。越高代表回答越流暢。\n\n"
+    md += "| 指標 | **數值** | 說明 |\n|---|:---:|---|\n"
+    md += f"| **平均 TPS** | **{tps_stats['avg_tps']:.1f} tok/s** | **平均每秒輸出字數（核心速度指標）** |\n"
+    md += f"| P50 TPS | {tps_stats['p50_tps']:.1f} tok/s | 有一半的請求達到這個速度 |\n"
+    md += f"| P95 TPS | {tps_stats['p95_tps']:.1f} tok/s | 只有 5% 的請求比這個慢 |\n"
+    md += f"| 最高 TPS | {tps_stats['max_tps']:.1f} tok/s | 本次測試單次最高速度 |\n"
     if tps_stats.get("avg_ttft") is not None:
-        md += f"| 平均 TTFT (首 Token 延遲) | {tps_stats['avg_ttft']:.3f} 秒 |\n"
-        md += f"| P95 TTFT | {tps_stats['p95_ttft']:.3f} 秒 |\n"
-    md += f"| 平均輸出 Tokens | {tps_stats['avg_output_tokens']:.0f} |\n"
-    md += f"| 最大輸出 Tokens (單次) | {tps_stats['max_output_tokens']} |\n"
-    md += f"| 合計輸出 Tokens | {tps_stats['total_output_tokens']:,} |\n"
+        md += (
+            f"| **平均 TTFT**（首字等待）| **{tps_stats['avg_ttft']:.3f} 秒** "
+            f"| **送出問題後看到第一個字的等待時間** |\n"
+        )
+        md += f"| P95 TTFT | {tps_stats['p95_ttft']:.3f} 秒 | 95% 的請求首字等待不超過此值 |\n"
+    md += f"| 平均每次輸出字數 | {tps_stats['avg_output_tokens']:.0f} tokens | 每個回答平均包含多少字詞 |\n"
+    md += f"| 單次最多輸出字數 | {tps_stats['max_output_tokens']:,} tokens | 最長的那一次回答共幾個字 |\n"
+    md += f"| 本次測試總輸出字數 | {tps_stats['total_output_tokens']:,} tokens | 所有回答加總 |\n\n"
 
-    # ── 分階段動態壓測 ────────────────────────────────────────────
-    md += "\n## 🧪 分階段動態壓測結果（Concurrency Sweep）\n\n"
-    md += "| 階段 | 併發數 | 成功率 | RPS | P95延遲(s) | 平均延遲(s) | 平均TPS | 平均輸出Tokens |\n"
+    # ══════════════════════════════════════════════════════════════
+    # 🧪 分階段壓測結果
+    # ══════════════════════════════════════════════════════════════
+    md += "## 🧪 分階段壓測結果（Concurrency Sweep）\n\n"
+    md += (
+        "> **Concurrency Sweep（同時請求數遞增測試）**：從 2 個同時請求逐步加碼，"
+        "觀察系統在不同壓力下的穩定性與速度變化。\n\n"
+    )
+    md += "| 階段 | 同時請求數 | 成功率 | RPS（每秒完成數）| P95 等待(秒) | 平均等待(秒) | 平均字速(tok/s) | 平均回答長度 |\n"
     md += "|---|---:|---:|---:|---:|---:|---:|---:|\n"
     for s in stage_metrics:
+        sr = s["success_rate"]
+        sr_flag = "✅" if sr >= 95 else ("⚠️" if sr >= 80 else "❌")
         md += (
-            f"| {s['phase']} | {s['concurrency']} | {s['success_rate']:.1f}% | "
+            f"| {s['phase']} | **{s['concurrency']}** | {sr_flag} {sr:.1f}% | "
             f"{s['rps']:.3f} | {s['p95_latency']:.2f} | {s['avg_latency']:.2f} | "
             f"{s['avg_tps']:.0f} | {s['avg_output_tokens']:.0f} |\n"
         )
+    md += "\n"
 
-    # ── Max-Tokens Sweep ──────────────────────────────────────────
-    md += "\n## 📏 最大 Token 產生數測試（Max-Tokens Sweep）\n\n"
-    md += f"> 每個 max_tokens 等級使用 {MAX_TOKEN_SWEEP_CONCURRENCY} 個並發請求，評估模型在不同輸出長度下的表現。\n\n"
-    md += "| max_tokens | 成功率 | 平均延遲(s) | P95延遲(s) | 平均TPS | 平均實際輸出Tokens | 最大實際輸出Tokens |\n"
+    # ══════════════════════════════════════════════════════════════
+    # 📏 最大輸出長度測試
+    # ══════════════════════════════════════════════════════════════
+    md += "## 📏 最大輸出長度測試（Max-Tokens Sweep）\n\n"
+    md += (
+        f"> **Max-Tokens Sweep（最大字數測試）**：固定 {MAX_TOKEN_SWEEP_CONCURRENCY} 個同時請求，"
+        "把允許輸出的最大字數從短到長逐步提升，找出模型實際能穩定輸出的極限。\n\n"
+    )
+    md += "| 允許最大字數 | 成功率 | 平均等待(秒) | P95 等待(秒) | 平均字速(tok/s) | 實際平均輸出 | 實際最多輸出 |\n"
     md += "|---:|---:|---:|---:|---:|---:|---:|\n"
-    for s in max_token_stage_metrics:
-        md += (
-            f"| {s['concurrency']} | {s['success_rate']:.1f}% | "
-            f"{s['avg_latency']:.2f} | {s['p95_latency']:.2f} | "
-            f"{s['avg_tps']:.0f} | {s['avg_output_tokens']:.0f} | "
-            f"{s.get('max_output_tokens', 0)} |\n"
-        )
 
-    # 找出實際可達最大 token 數
     max_successful_tokens = 0
     for s in max_token_stage_metrics:
-        if s["success_rate"] >= 80.0 and s.get("max_output_tokens", 0) > max_successful_tokens:
-            max_successful_tokens = s.get("max_output_tokens", 0)
+        sr = s["success_rate"]
+        sr_flag = "✅" if sr >= 95 else ("⚠️" if sr >= 80 else "❌")
+        max_out = s.get("max_output_tokens", 0)
+        if sr >= 80.0 and max_out > max_successful_tokens:
+            max_successful_tokens = max_out
+        md += (
+            f"| **{s['concurrency']}** | {sr_flag} {sr:.1f}% | "
+            f"{s['avg_latency']:.2f} | {s['p95_latency']:.2f} | "
+            f"{s['avg_tps']:.0f} | {s['avg_output_tokens']:.0f} | "
+            f"**{max_out:,}** |\n"
+        )
+    md += "\n"
     if max_successful_tokens > 0:
-        md += f"\n> **實測可達最大輸出 Tokens（成功率 ≥ 80%）**: **{max_successful_tokens:,}** tokens\n\n"
+        md += (
+            f"> 🏁 **實測可穩定輸出的最大長度（成功率 ≥ 80%）**："
+            f"**{max_successful_tokens:,} tokens**（約 {max_successful_tokens // 1.3:.0f} 個中文字）\n\n"
+        )
 
-    # ── 評分 ──────────────────────────────────────────────────────
-    md += "## 🧮 結果評分\n\n"
-    md += f"- **評分分數**: {evaluation['score']} / 100\n"
-    md += f"- **評分等級**: {evaluation['grade']}\n"
-    md += f"- **成功率**: {evaluation['success_rate']:.2f}%\n"
-    md += f"- **評語**: {evaluation['comment']}\n\n"
+    # ══════════════════════════════════════════════════════════════
+    # 🧮 評分 & 🎯 併發建議
+    # ══════════════════════════════════════════════════════════════
+    md += "## 🧮 評分結果\n\n"
+    md += f"### {grade_emoji} 等級：**{grade}**　分數：**{score} / 100**\n\n"
+    md += f"> **{evaluation['comment']}**\n\n"
+    md += "| 評分面向 | 使用指標 |\n|---|---|\n"
+    md += f"| 穩定性（35 分）| 成功率 {success_rate:.1f}% |\n"
+    md += f"| 回應速度（30 分）| P95 延遲 {latency_stats['p95']:.2f} 秒 |\n"
+    md += f"| 吞吐量（20 分）| RPS {rps:.3f} 次/秒 |\n"
+    md += f"| 字速（15 分）| 平均 TPS {tps_stats['avg_tps']:.1f} tok/s |\n\n"
 
-    # ── 容量推估 ──────────────────────────────────────────────────
-    users = capacity_estimate["estimated_concurrent_users"]
-    assumptions = capacity_estimate["assumptions"]
-    md += "## 👥 RPS 推估同時連線人數\n\n"
+    md += "## 🎯 建議最佳同時連線數\n\n"
+    md += f"> **建議值：{rec_con} 個同時連線**（選擇依據：{concurrency_recommendation['selection_mode']}）\n\n"
+    md += f"- **判定原因**：{concurrency_recommendation['reason']}\n"
     md += (
-        f"已套用安全係數 **{capacity_estimate['safety_factor']}**，"
-        f"可用 RPS 約 **{capacity_estimate['usable_rps']}**。\n\n"
-    )
-    md += "| 使用情境 | 假設每位使用者 RPS | 建議同時連線人數 |\n|---|---:|---:|\n"
-    md += f"| 輕量 (~30秒一次) | {assumptions['light_user_rps']} | {users['light']} |\n"
-    md += f"| 一般 (~10秒一次) | {assumptions['normal_user_rps']} | {users['normal']} |\n"
-    md += f"| 重度 (~2秒一次) | {assumptions['heavy_user_rps']} | {users['heavy']} |\n\n"
-
-    # ── 最佳併發建議 ──────────────────────────────────────────────
-    md += "## 🎯 自動建議最佳併發值\n\n"
-    md += f"- **建議併發值**: {concurrency_recommendation['recommended_concurrency']}\n"
-    md += f"- **選擇模式**: {concurrency_recommendation['selection_mode']}\n"
-    md += f"- **判定依據**: {concurrency_recommendation['reason']}\n"
-    thresholds = concurrency_recommendation["thresholds"]
-    md += (
-        f"- **目標門檻**: 成功率 >= {thresholds['success_rate_percent']}%, "
-        f"P95 <= {thresholds['p95_latency_seconds']} 秒\n\n"
+        f"- **達標門檻**：成功率 ≥ {thresholds['success_rate_percent']}%，"
+        f"P95 等待時間 ≤ {thresholds['p95_latency_seconds']} 秒\n\n"
     )
 
-    # ── 詳細請求記錄（Concurrency Sweep） ────────────────────────
-    md += "## 📝 Concurrency Sweep 詳細記錄\n\n"
-    md += "| # | Prompt 摘要 | 延遲(s) | TTFT(s) | 輸出Tokens | TPS | 狀態 |\n"
-    md += "|---|---|---:|---:|---:|---:|---:|\n"
+    # ══════════════════════════════════════════════════════════════
+    # 👥 容量推估
+    # ══════════════════════════════════════════════════════════════
+    md += "## 👥 可承載同時上線人數估算\n\n"
+    md += (
+        f"> 套用安全係數 **{capacity_estimate['safety_factor']}**"
+        f"（保留 {int((1 - capacity_estimate['safety_factor']) * 100)}% 餘量防止突波），"
+        f"可用吞吐量約 **{capacity_estimate['usable_rps']} 次/秒**。\n\n"
+    )
+    md += "| 使用情境 | 假設發問頻率 | 技術參數（RPS） | **可支援人數** |\n|---|---|---:|---:|\n"
+    md += f"| 🟢 輕量（偶爾問一下）| 約 30 秒發一次 | {assumptions['light_user_rps']} | **{users['light']} 人** |\n"
+    md += f"| 🟡 一般（正常使用）| 約 10 秒發一次 | {assumptions['normal_user_rps']} | **{users['normal']} 人** |\n"
+    md += f"| 🔴 重度（密集使用）| 約 2 秒發一次 | {assumptions['heavy_user_rps']} | **{users['heavy']} 人** |\n\n"
+
+    # ══════════════════════════════════════════════════════════════
+    # 📝 詳細記錄
+    # ══════════════════════════════════════════════════════════════
+    md += "## 📝 每次請求詳細記錄（Concurrency Sweep）\n\n"
+    md += "| # | 問題摘要 | 等待(秒) | 首字等待 TTFT(秒) | 輸出字數 | 字速(tok/s) | 結果 |\n"
+    md += "|---|---|---:|---:|---:|---:|:---:|\n"
     for r in concurrency_results:
         ttft_str = f"{r['ttft']:.3f}" if r.get("ttft") is not None else "—"
         status = "✅" if r["success"] else "❌"
         md += (
             f"| {r['id']} | {r['prompt'][:60]}… | {r['latency']:.2f} | "
-            f"{ttft_str} | {r.get('output_tokens', 0)} | {r.get('tokens_per_second', 0):.0f} | {status} |\n"
+            f"{ttft_str} | {r.get('output_tokens', 0):,} | {r.get('tokens_per_second', 0):.0f} | {status} |\n"
         )
 
-    # ── 詳細請求記錄（Max-Tokens Sweep） ─────────────────────────
-    md += "\n## 📏 Max-Tokens Sweep 詳細記錄\n\n"
-    md += "| # | max_tokens | Prompt 摘要 | 延遲(s) | 實際輸出Tokens | TPS | 狀態 |\n"
-    md += "|---|---:|---|---:|---:|---:|---:|\n"
+    md += "\n## 📏 每次請求詳細記錄（Max-Tokens Sweep）\n\n"
+    md += "| # | 允許最大字數 | 問題摘要 | 等待(秒) | 實際輸出字數 | 字速(tok/s) | 結果 |\n"
+    md += "|---|---:|---|---:|---:|---:|:---:|\n"
     for r in max_token_sweep_results:
         status = "✅" if r["success"] else "❌"
         md += (
             f"| {r['id']} | {r.get('max_tokens_requested', '—')} | "
             f"{r['prompt'][:50]}… | {r['latency']:.2f} | "
-            f"{r.get('output_tokens', 0)} | {r.get('tokens_per_second', 0):.0f} | {status} |\n"
+            f"{r.get('output_tokens', 0):,} | {r.get('tokens_per_second', 0):.0f} | {status} |\n"
         )
 
-    md += "\n---\n\n> *報告由 `run_vllm_text_gen_test.py` 自動生成。*\n"
+    md += "\n---\n\n"
+    md += "> *報告由 `run_vllm_text_gen_test.py` 自動生成。*\n"
     md += "> **create by : bitons & cursor**\n"
     return md
 
@@ -822,6 +938,7 @@ def generate_markdown_report(
 # ── 主程式 ────────────────────────────────────────────────────────
 
 async def main():
+    global MODEL_ID
     print("=" * 65)
     print(f"  vLLM 文字生成壓力測試")
     print(f"  模型: {MODEL_ID}")
@@ -870,7 +987,7 @@ async def main():
         "•",
         TimeElapsedColumn(),
         "•",
-        TimeRemainingColumn(),
+        TextColumn("[cyan]{task.fields[tps]}"),
     )
 
     with progress:
@@ -879,12 +996,14 @@ async def main():
             total=concurrency_total,
             success=0,
             failed=0,
+            tps="—",
         )
         overall_b_task = progress.add_task(
             f"[bold magenta][Phase B] Max-Tokens Sweep  {len(MAX_TOKEN_SWEEP_LEVELS)} 等級",
             total=max_token_total,
             success=0,
             failed=0,
+            tps="—",
         )
 
         try:
@@ -900,6 +1019,43 @@ async def main():
                             indent=2, ensure_ascii=False,
                         ),
                     )
+                    all_model_ids = model_probe.get("all_model_ids", [])
+                    if len(all_model_ids) > 1:
+                        # 多個模型：讓使用者手動選擇
+                        print(f"\n[模型選擇] 伺服器提供 {len(all_model_ids)} 個模型：")
+                        for i, mid in enumerate(all_model_ids, 1):
+                            marker = "  ← 目前設定" if mid == MODEL_ID else ""
+                            print(f"  [{i}] {mid}{marker}")
+                        default_idx = next(
+                            (i for i, m in enumerate(all_model_ids, 1) if m == MODEL_ID), 1
+                        )
+                        while True:
+                            choice = input(
+                                f"請選擇模型編號 (1-{len(all_model_ids)}, Enter=預設[{default_idx}]): "
+                            ).strip()
+                            if choice == "":
+                                chosen = all_model_ids[default_idx - 1]
+                                break
+                            elif choice.isdigit() and 1 <= int(choice) <= len(all_model_ids):
+                                chosen = all_model_ids[int(choice) - 1]
+                                break
+                            else:
+                                print(f"  請輸入 1 到 {len(all_model_ids)} 之間的數字")
+                        if chosen != MODEL_ID:
+                            print(f"[模型選擇] 已切換模型: {MODEL_ID} → {chosen}")
+                            MODEL_ID = chosen
+                        else:
+                            print(f"[模型選擇] 使用模型: {MODEL_ID}")
+                    else:
+                        # 單一模型：自動偵測對齊
+                        detected_model = model_probe.get("primary_model_id")
+                        if detected_model and detected_model != MODEL_ID:
+                            print(f"[自動偵測] 伺服器模型 ID 與設定不符，自動更新：")
+                            print(f"  設定值: {MODEL_ID}")
+                            print(f"  偵測值: {detected_model}  ← 改用此值")
+                            MODEL_ID = detected_model
+                        elif detected_model:
+                            print(f"[模型確認] 使用模型: {MODEL_ID}")
                 else:
                     print(f"[警告] 無法取得 /v1/models：{model_probe}")
 
@@ -917,6 +1073,7 @@ async def main():
                         total=stage_concurrency,
                         success=0,
                         failed=0,
+                        tps="—",
                     )
 
                     prompts_for_stage = []
@@ -952,11 +1109,19 @@ async def main():
                     sm["max_output_tokens"] = max(token_list) if token_list else 0
                     stage_metrics.append(sm)
 
-                    progress.update(stage_task, description=(
+                    _a_tps = f"~{sm['avg_tps']:.0f} t/s  p95={sm['p95_latency']:.1f}s"
+                    progress.update(stage_task, tps=_a_tps, description=(
                         f"[green]  ✓ Phase A-{phase_idx}/{total_phases}  "
                         f"[bold white]併發 {stage_concurrency}[/bold white]  "
                         f"✅{stage_stats['success']} ❌{stage_stats['failed']}"
                     ))
+                    # 更新整體 Phase A 進度列的累計 TPS
+                    _a_all_tps = [
+                        r["tokens_per_second"] for r in all_concurrency_results
+                        if r.get("success") and r.get("tokens_per_second", 0) > 0
+                    ]
+                    if _a_all_tps:
+                        progress.update(overall_a_task, tps=f"avg {mean(_a_all_tps):.0f} t/s")
                     await asyncio.sleep(0.5)
 
                 # ─ Phase B: Max-Tokens Sweep ──────────────────────
@@ -972,6 +1137,7 @@ async def main():
                         total=MAX_TOKEN_SWEEP_CONCURRENCY,
                         success=0,
                         failed=0,
+                        tps="—",
                     )
 
                     sweep_prompts = []
@@ -1009,11 +1175,22 @@ async def main():
                     sm_b["max_output_tokens"] = max(token_list_b) if token_list_b else 0
                     max_token_stage_metrics.append(sm_b)
 
-                    progress.update(sweep_task, description=(
+                    _b_tps = (
+                        f"~{sm_b['avg_tps']:.0f} t/s  "
+                        f"max={sm_b['max_output_tokens']}tok"
+                    )
+                    progress.update(sweep_task, tps=_b_tps, description=(
                         f"[blue]  ✓ Phase B-{level_idx}/{len(MAX_TOKEN_SWEEP_LEVELS)}  "
                         f"[bold white]max_tokens={max_tok}[/bold white]  "
                         f"✅{sweep_stage_stats['success']} ❌{sweep_stage_stats['failed']}"
                     ))
+                    # 更新整體 Phase B 進度列的累計 TPS
+                    _b_all_tps = [
+                        r["tokens_per_second"] for r in all_max_token_results
+                        if r.get("success") and r.get("tokens_per_second", 0) > 0
+                    ]
+                    if _b_all_tps:
+                        progress.update(overall_b_task, tps=f"avg {mean(_b_all_tps):.0f} t/s")
                     print(
                         f"  [B-{level_idx}] max_tokens={max_tok:>6}  "
                         f"成功={sweep_stage_stats['success']}/{MAX_TOKEN_SWEEP_CONCURRENCY}  "
