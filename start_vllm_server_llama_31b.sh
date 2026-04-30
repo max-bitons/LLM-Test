@@ -16,7 +16,7 @@ vllm_print_kv() {
     printf '  %-26s %s\n' "$1" "$2"
 }
 
-vllm_print_title "vLLM OpenAI API｜壓力測試／對齊 Qwen 腳本｜Llama 3.1 NVFP4｜32K×16"
+vllm_print_title "vLLM OpenAI API｜壓力測試／對齊 Qwen｜Llama 3.1 8B NVFP4｜64K ctx × 32 併發（記憶體持平）"
 
 source vllm_env/bin/activate
 
@@ -27,7 +27,9 @@ if [ -z "${OMP_NUM_THREADS+x}" ]; then
 fi
 
 # --- 模型設定 ---
-# 預設：NVIDIA Llama 3.1 Instruct NVFP4（與舊版腳本一致；壓測 70B：export LLAMA_MODEL_ID=nvidia/Llama-3.1-70B-Instruct-NVFP4）
+# 預設：NVIDIA Llama 3.1 8B Instruct NVFP4；長文預設 max-model-len=64K（KV 變大，OOM 可降 VLLM_MAX_NUM_SEQS 或調高 GPU_MEMORY_UTILIZATION）
+# 其他模型：壓測 70B export LLAMA_MODEL_ID=nvidia/Llama-3.1-70B-Instruct-NVFP4 等
+# Llama 3.3 NVFP4（例：nvidia/Llama-3.3-70B-Instruct-NVFP4）之 hf_quant_config 為 modelopt_fp4，腳本會自動帶入，勿再設 VLLM_QUANTIZATION=nvfp4。
 # FP8：LLAMA_MODEL_ID=nvidia/Llama-3.1-70B-Instruct-FP8 並通常需 export VLLM_QUANTIZATION=fp8（依 vLLM 版本為準）
 MODEL_ID=${LLAMA_MODEL_ID:-"nvidia/Llama-3.1-8B-Instruct-NVFP4"}
 
@@ -35,6 +37,10 @@ MODEL_ID=${LLAMA_MODEL_ID:-"nvidia/Llama-3.1-8B-Instruct-NVFP4"}
 _default_quant_for_model() {
     case "$MODEL_ID" in
         *[Aa][Ww][Qq]*) printf '%s' awq ;;
+        # vLLM：須與 hf_quant_config.quant_algo 一致；3.3 NVFP4 為 NVIDIA Model Optimizer FP4，傳 nvfp4 會 ValidationError
+        *[Ll]lama-3.3*[Nn][Vv][Ff][Pp]4* | *[Ll]lama-3_3*[Nn][Vv][Ff][Pp]4* | *[Ll]lama-3.3*-NVFP4* | *[Ll]lama-3.3*-nvfp4* | *[Ll]lama-3_3*-NVFP4* | *[Ll]lama-3_3*-nvfp4*)
+            printf '%s' modelopt_fp4
+            ;;
         *[Nn][Vv][Ff][Pp]4* | *-NVFP4* | *-nvfp4*) printf '%s' nvfp4 ;;
         *-FP8* | *-fp8*) printf '%s' fp8 ;;
         *) ;;
@@ -65,13 +71,16 @@ fi
 # --- 服務埠（與 Qwen 腳本預設 8002 分開，避免同機雙開衝突） ---
 VLLM_API_PORT=${VLLM_API_PORT:-8001}
 
-# --- gpu-memory-utilization（與 start_vllm_server_qwen3.5.sh 相同預設邏輯） ---
+# --- gpu-memory-utilization（與 Qwen 腳本相同：預設 0.55 與其他行程共用時較穩；獨占 GPU 再調高） ---
 GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.55}
 
-# --- 上下文／批次／併發（壓測對齊：32K、16 路、略保守 batched-tokens） ---
-MAX_MODEL_LEN=${VLLM_MAX_MODEL_LEN:-32768}
+# --- 上下文／批次／併發（預設：文長 64K、最大併發 32；記憶體持平策略與 Qwen 腳本類似） ---
+# max-num-seqs=32：同時在線序列上限。
+# max-model-len=65536：長文 64K；較短需求可 export VLLM_MAX_MODEL_LEN=32768。
+# max-num-batched-tokens=12288：預設較低，壓低長文同時 prefill 的尖峰；64K 下仍建議勿盲目拉高以免 OOM。
+MAX_MODEL_LEN=${VLLM_MAX_MODEL_LEN:-65536}
 MAX_NUM_BATCHED_TOKENS=${VLLM_MAX_NUM_BATCHED_TOKENS:-12288}
-MAX_NUM_SEQS=${VLLM_MAX_NUM_SEQS:-16}
+MAX_NUM_SEQS=${VLLM_MAX_NUM_SEQS:-32}
 
 # --- KV：Llama 3.x 純 Decoder，可沿用 turboquant_k8v4（與 Qwen 非混合款相同策略） ---
 _default_kv_for_model() {
@@ -102,8 +111,8 @@ VLLM_ATTENTION_BACKEND=${VLLM_ATTENTION_BACKEND:-}
 VLLM_VERSION=$(python -c "import vllm; print(getattr(vllm, '__version__', 'unknown'))" 2>/dev/null || echo "unknown")
 
 vllm_print_section "場景（壓力測試／對齊 Qwen）"
-echo "    預設：max-model-len=32K、max-num-seqs=16、throughput、chunked prefill + async scheduling（若 CLI 支援）。"
-echo "    與 Qwen 腳本相同之記憶體預設（gpu-mem 0.55、swap 4、prefix 關、mm-cache 0）；獨占 GPU 壓測可 export GPU_MEMORY_UTILIZATION=0.65～0.75。"
+echo "    預設對齊：文長 64K（65536）、最大併發 32（max-num-seqs）；throughput、chunked prefill + async scheduling（若 CLI 支援）。"
+echo "    記憶體持平：與 Qwen 相同（gpu-mem 0.55、max-num-batched-tokens 12288 降 prefill 尖峰、swap 4、prefix 關、mm-cache 0）；獨占 GPU 可 export GPU_MEMORY_UTILIZATION=0.65～0.75。"
 echo "    覆寫模型：LLAMA_MODEL_ID ；埠：VLLM_API_PORT（預設 8001）。多行程同卡請協調 CUDA／MPS。"
 
 vllm_print_section "環境與模型"
@@ -116,12 +125,12 @@ vllm_print_kv "連線基底" "http://0.0.0.0:${VLLM_API_PORT}/v1"
 vllm_print_kv "健全檢查" "http://0.0.0.0:${VLLM_API_PORT}/v1/models"
 
 vllm_print_section "上下文與批次"
-vllm_print_kv "max-model-len" "$MAX_MODEL_LEN"
-vllm_print_kv "max-num-batched-tokens" "$MAX_NUM_BATCHED_TOKENS"
-vllm_print_kv "max-num-seqs" "$MAX_NUM_SEQS"
+vllm_print_kv "max-model-len" "$MAX_MODEL_LEN（預設 64K）"
+vllm_print_kv "max-num-batched-tokens" "$MAX_NUM_BATCHED_TOKENS（預設較低＝省 prefill 尖峰；長 prompt 混排可 export 拉高）"
+vllm_print_kv "max-num-seqs" "$MAX_NUM_SEQS（需求 32 路；OOM 時再降 seqs 或調 gpu-mem／batched-tokens）"
 
 vllm_print_section "記憶體與資料型別"
-vllm_print_kv "gpu-memory-utilization" "$GPU_MEMORY_UTILIZATION"
+vllm_print_kv "gpu-memory-utilization" "$GPU_MEMORY_UTILIZATION（預設 0.55：與他程式共用 GPU；僅 vLLM 可 0.65～0.75）"
 vllm_print_kv "swap-space (GB)" "$VLLM_SWAP_SPACE"
 if [ "${ENABLE_PREFIX_CACHING:-0}" = "1" ]; then
     pc_state="啟用"

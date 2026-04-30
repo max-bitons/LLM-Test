@@ -1,4 +1,6 @@
 # 產能壓測。清單：llm_production_test_suite.py；SLO/混勻/soak：llm_production_harness.py
+from __future__ import annotations
+
 import argparse
 import asyncio
 import ipaddress
@@ -8,11 +10,168 @@ import time
 from datetime import datetime
 import json
 import os
+import pathlib
 import platform
+import random
 import subprocess
 import sys
 from urllib.parse import urlparse, urlunparse
 
+try:
+    from rich.console import Console, Group
+    from rich.live import Live
+    from rich.panel import Panel
+    from rich.text import Text
+
+    HAVE_RICH = True
+except ImportError:
+    HAVE_RICH = False
+    Console = Group = Live = Panel = Text = None  # type: ignore
+
+_NO_RICH_LIVE_CLI_OFF = False
+_RICH_LIVE_ENV = os.environ.get("VLLM_RICH_LIVE", "1").strip().lower()
+
+
+def _read_stream_preview_chars(default: int = 560) -> int:
+    raw = os.environ.get("VLLM_RICH_PREVIEW_CHARS", "").strip()
+    if not raw.isdigit():
+        return max(160, default)
+    return max(120, min(8000, int(raw)))
+
+
+STREAM_PREVIEW_CHARS = _read_stream_preview_chars()
+
+
+def _want_rich_sse_dashboard(use_streaming: bool) -> bool:
+    """是否啟動併發 SSE 的 Rich Live 儀表板（終端機 + 有 rich + 未被 CLI 停用）。"""
+    if not HAVE_RICH or not use_streaming:
+        return False
+    if not sys.stdout.isatty():
+        return False
+    if _NO_RICH_LIVE_CLI_OFF:
+        return False
+    return _RICH_LIVE_ENV not in ("0", "false", "no", "off")
+
+
+def _squish_visible(s: str, n: int) -> str:
+    s = " ".join(s.replace("\r", "").replace("\x1b", "").split())
+    if len(s) <= n:
+        return s
+    return s[: n - 1] + "…"
+
+
+def _tail_preview(s: str, n: int) -> str:
+    if len(s) <= n:
+        return s
+    return "…" + s[-(n - 1) :]
+
+
+class _ConcurrentStreamDashboard:
+    """併發 SSE 時，以 Rich Live 刷新每請求的最新 delta 與尾段正文預覽。"""
+
+    __slots__ = (
+        "_n",
+        "_lock",
+        "_buf",
+        "_last_delta",
+        "_status",
+        "_live",
+    )
+
+    def __init__(self, n_streams: int) -> None:
+        self._n = n_streams
+        self._lock = asyncio.Lock()
+        self._buf: dict[int, str] = {i: "" for i in range(n_streams)}
+        self._last_delta: dict[int, str] = {i: "" for i in range(n_streams)}
+        self._status: dict[int, str] = {i: "等待請求發送…" for i in range(n_streams)}
+        self._live: Live | None = None
+
+    def bind_live(self, live: Live | None) -> None:
+        self._live = live
+
+    async def set_status(self, rid: int, text: str) -> None:
+        async with self._lock:
+            self._status[rid] = text
+        await self._paint_async()
+
+    async def append_piece(self, rid: int, piece: str) -> None:
+        if not piece:
+            return
+        async with self._lock:
+            self._buf[rid] += piece
+            mx = STREAM_PREVIEW_CHARS * 3
+            if len(self._buf[rid]) > mx:
+                self._buf[rid] = self._buf[rid][-mx:]
+            self._last_delta[rid] = piece
+            self._status[rid] = f"串流中 · 已約 {len(self._buf[rid])} 字"
+        await self._paint_async()
+
+    async def set_response_preview(self, rid: int, full_text: str) -> None:
+        async with self._lock:
+            self._buf[rid] = _tail_preview(full_text, STREAM_PREVIEW_CHARS * 2)
+            self._last_delta[rid] = self._buf[rid][-80:] if self._buf[rid] else ""
+            self._status[rid] = "已取得完整正文"
+        await self._paint_async()
+
+    async def mark_terminal(self, rid: int, label: str) -> None:
+        async with self._lock:
+            self._status[rid] = label
+        await self._paint_async()
+
+    def _build_group(self) -> Group:
+        assert HAVE_RICH and Panel is not None and Text is not None
+        rows: list[Panel] = []
+        for rid in range(self._n):
+            pv = self._buf[rid]
+            body = Text(_tail_preview(pv, STREAM_PREVIEW_CHARS), overflow="fold", no_wrap=False)
+            subtitle = Text()
+            subtitle.append(self._status[rid] + "\n", style="dim")
+            subtitle.append("上一段收到的內容 · ", style="cyan")
+            subtitle.append(_squish_visible(self._last_delta[rid], 110), style="yellow")
+            rows.append(
+                Panel(
+                    body,
+                    title=f"[bold cyan]請求 #{rid}[/bold cyan]",
+                    subtitle=subtitle,
+                    border_style="cyan",
+                    padding=(0, 1),
+                )
+            )
+        hdr = Panel(
+            "[bold]即時 SSE 串流面板[/bold] — Panel 正文為尾部預覽；subtitle 為狀態與上一則收到的 delta。\n"
+            f"[dim]VLLM_RICH_PREVIEW_CHARS 調整尾預覽約 {STREAM_PREVIEW_CHARS} 字 · "
+            "VLLM_RICH_LIVE=0 或 --no-rich-live 關閉[/dim]",
+            border_style="magenta",
+        )
+        inner = Group(*rows)
+        return Group(hdr, inner)
+
+    async def _paint_async(self) -> None:
+        if self._live is None:
+            return
+        async with self._lock:
+            grp = self._build_group()
+        self._live.update(grp)
+
+
+class StreamGenerationTimeout(Exception):
+    """SSE 正文讀取已超過單請求 wall-clock 門檻；攜帶已累積的片段與 usage。"""
+
+    __slots__ = ("elapsed_sec", "deadline_sec", "partial_content", "usage")
+
+    def __init__(
+        self,
+        *,
+        elapsed_sec: float,
+        deadline_sec: float,
+        partial_content: str,
+        usage: dict,
+    ) -> None:
+        super().__init__("SSE 產出逾時")
+        self.elapsed_sec = elapsed_sec
+        self.deadline_sec = deadline_sec
+        self.partial_content = partial_content
+        self.usage = dict(usage) if usage else {}
 
 def get_system_info():
     info = []
@@ -94,6 +253,25 @@ def _read_float(name: str, default: str) -> float:
 
 SAMPLING_TEMPERATURE = _read_float("VLLM_TEMPERATURE", "0.85")
 SAMPLING_TOP_P = _read_float("VLLM_TOP_P", "0.95")
+# 略為提高可降低反覆嘗試同一語料的機率；建議 0.1～0.5（OpenAI API 合法範圍仍為 -2～2）
+SAMPLING_PRESENCE_PENALTY = max(-2.0, min(2.0, _read_float("VLLM_PRESENCE_PENALTY", "0.2")))
+# 流式輸出：前端／客戶端可及早收到 delta、較易逾時取消；壓測預設開啟（VLLM_CHAT_STREAM=0 關閉）
+_STREAM_ENV = os.environ.get("VLLM_CHAT_STREAM", "1").strip().lower()
+USE_STREAMING = _STREAM_ENV not in ("0", "false", "no", "off")
+
+
+def _read_stream_generation_timeout_sec(default: float = 120.0) -> float:
+    raw = os.environ.get("VLLM_STREAM_GENERATION_TIMEOUT", "").strip()
+    if not raw:
+        return default
+    try:
+        return max(1.0, float(raw))
+    except ValueError:
+        return default
+
+
+# 單則請求產出門檻：SSE 自開始讀取 body 起、或非流式讀完整 JSON，逾時即中止並記錄（秒；VLLM_STREAM_GENERATION_TIMEOUT）
+STREAM_GENERATION_TIMEOUT_SEC = _read_stream_generation_timeout_sec()
 # 僅用於寫日誌：當 /v1/models 無法取得 max_model_len 時，回退顯示此值（與 vLLM 啟動參數一致時較準）
 FALLBACK_MAX_MODEL_LEN = os.environ.get("VLLM_MAX_MODEL_LEN", "")
 # 請求 body 的 `model` 必須與服務端 served model id 一致。
@@ -156,6 +334,11 @@ def parse_cli(argv=None) -> argparse.Namespace:
         description=(
             "本機 OpenAI 相容 Chat Completions API（vLLM、litellm 代理等）以固定併發量測 token 產能（系統級 TPS）。"
             "預設 16 併發，可用 -c／VLLM_CONCURRENT 調整；預設附角色扮演型 system（VLLM_SYSTEM_PROMPT 可覆寫）。"
+            "預設 stream=True（SSE）並設 presence_penalty=0.2，便於客戶端逾時取消並降低重複循環；"
+            "環境變數 VLLM_CHAT_STREAM=0 或 --no-stream 可改回非流式。"
+            "單則產出在預設 **120 s**（`VLLM_STREAM_GENERATION_TIMEOUT`）內須完成，否則中止該請求並記錄。"
+            "在 TTY 且已安裝 **rich**、且為 SSE 模式時，會以 **Rich Live** 顯示各路請求即時 delta；"
+            "可用 `VLLM_RICH_LIVE=0` 或 `--no-rich-live` 關閉。"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
@@ -167,6 +350,10 @@ def parse_cli(argv=None) -> argparse.Namespace:
             "  python p620-scripts/test_max_tps.py -u http://127.0.0.1:8002 -c 64\n"
             "  # 無終端互動時（例如 CI）若伺服器有多個模型：\n"
             "  VLLM_CHAT_MODEL=my-model-id python p620-scripts/test_max_tps.py -u http://127.0.0.1:8002\n"
+            "  # 調整串流「產出完成」門檻（秒，預設 120）：\n"
+            "  VLLM_STREAM_GENERATION_TIMEOUT=300 python p620-scripts/test_max_tps.py -u http://127.0.0.1:8002\n"
+            "  # 關閉即時 Rich 面板（仍寫報告）：\n"
+            "  python p620-scripts/test_max_tps.py -u http://127.0.0.1:8002 --no-rich-live\n"
         ),
     )
     p.add_argument(
@@ -219,6 +406,22 @@ def parse_cli(argv=None) -> argparse.Namespace:
     p.add_argument("--temperature", type=float, default=SAMPLING_TEMPERATURE)
     p.add_argument("--top-p", type=float, default=SAMPLING_TOP_P)
     p.add_argument(
+        "--presence-penalty",
+        type=float,
+        default=SAMPLING_PRESENCE_PENALTY,
+        help="presence_penalty（預設 0.2；建議 0.1～0.5 減少重複循環；合法範圍 -2～2）",
+    )
+    p.add_argument(
+        "--no-stream",
+        action="store_true",
+        help="停用 SSE 流式（預設開啟 stream=True；關閉後無法邊收邊取消）",
+    )
+    p.add_argument(
+        "--no-rich-live",
+        action="store_true",
+        help="關閉 Rich 即時 SSE 面板；預設在 TTY 且 stream=SSE 且有安裝 rich 時開啟",
+    )
+    p.add_argument(
         "--timeout",
         type=float,
         default=_HTTP_TIMEOUT,
@@ -235,8 +438,10 @@ def parse_cli(argv=None) -> argparse.Namespace:
 def apply_cli_to_globals(args: argparse.Namespace) -> None:
     """將 CLI 結果寫回模組層變數，供 fetch / main 使用。"""
     global _LLM_BASE, URL, CHAT_MODEL, CONCURRENT_REQUESTS, MAX_TOKENS
-    global SAMPLING_TEMPERATURE, SAMPLING_TOP_P, _HTTP_TIMEOUT
+    global SAMPLING_TEMPERATURE, SAMPLING_TOP_P, SAMPLING_PRESENCE_PENALTY, USE_STREAMING
+    global _HTTP_TIMEOUT
     global _MAX_TOKENS_SOURCE, _MAX_TOKENS_NOTE
+    global _NO_RICH_LIVE_CLI_OFF
     if args.port is not None:
         try:
             _LLM_BASE = _apply_port_to_base_url(str(args.base_url), args.port)
@@ -263,7 +468,10 @@ def apply_cli_to_globals(args: argparse.Namespace) -> None:
         _MAX_TOKENS_SOURCE = "auto"
     SAMPLING_TEMPERATURE = float(args.temperature)
     SAMPLING_TOP_P = float(args.top_p)
+    SAMPLING_PRESENCE_PENALTY = max(-2.0, min(2.0, float(args.presence_penalty)))
+    USE_STREAMING = not bool(args.no_stream)
     _HTTP_TIMEOUT = max(1.0, float(args.timeout))
+    _NO_RICH_LIVE_CLI_OFF = bool(args.no_rich_live)
 
 
 async def preflight_local_llm(session: aiohttp.ClientSession) -> None:
@@ -514,99 +722,62 @@ def resolve_auto_max_tokens(entries: list, model_id: str, v1_info: dict) -> tupl
     return capped, note
 
 
-# 81 題：多步驟、帶條件與限制；含 20+ 程式/系統題。題數大於目前併發數時以輪詢分配 prompt。
-PROMPTS = [
-    # 高階科學、工程與社會 (1-12) — 要求因果鏈、比較架構、邊界條件
-    "量子糾纏與局域隱變量（Bell 不等式）的實驗邏輯是什麼？請用『假設—推論—實驗可證偽性』分三段說明，並指出與古典相關性直覺的衝突點。",
-    "以『輸入—表徵—目標—歸納偏置—泛化上界』五欄，比較深度學習與傳統機器學習在大型語料/少量標註情境的優劣，並舉兩個反例。",
-    "針對淨零路徑，請分別從技術、制度、地緣三層，說明為何同樣的碳價在已開發與新興經濟體的社會衝擊可能不同。",
-    "從 MEV、共識、狀態可用性、治理四面向，比較 PoW 公鏈與 PoS 公鏈在實務上的安全假設；每一面向至少一個實務攻擊或失效情境。",
-    "事件視界、霍金輻射、資訊弔詭（black hole information paradox）：請用中階讀者能懂的方式，串成一條因果敘事，明確指出目前理論不確定處。",
-    "在 EUV 微影、化學機械拋光、先進封裝之間，分析台灣半導體的『鎖釦』產業段落與兩大長期斷點風險。",
-    "以『在體/離體、可逆性、脫靶、多代遺傳』四條，討論 CRISPR 在遺傳病治登與農業的管制哲學差異。",
-    "在間歇性再生能源佔比上升時，電網的頻率穩定、儲能定位、市場設計各需要哪些新工具？每項畫出『問題—工具—量測指標』。",
-    "腦機介面：分侵入式/非侵入式，各給兩條臨床路徑、兩條人類增強 (H+) 的倫理爭點。",
-    "mRNA 與 adeno 載體疫苗在免疫原性、生產擴展、變種應變上如何取捨？以表格+一段綜合判準。",
-    "核融合三條主線：磁局限（如托卡馬克）、慣性局限、仿星器 (stellarator)；各自瓶頸是什麼，為何還在工程可行邊緣？",
-    "從大氣-海洋-冰層回饋，解釋為何氣候敏感度 (ECS) 的估計是區間而不是單一數；指出兩個非線性回饋。",
-    # 文學、藝術、美學 (13-22)
-    "比較《哈姆雷特》與《馬克白》中『行動延宕』的機制：角色心理、戲劇功能、讀者倫理距離。",
-    "以時間循環、家族姓名、敘事聲部三軸，解析《百年孤寂》如何製造『歷史即詛咒』的體感。",
-    "李白與杜甫的『自然』觀念有何差異？各引兩聯詩，說明意象選擇與政治倫理立場的關聯。",
-    "從敘事距離、身體隱喻、權力語法分析《變形記》的異化：不須劇情摘要，專做結構。",
-    "如果將『機器人三定律』寫成可測的規格，三條各自會遇到哪種衝突類型？各舉一則敘事與一則工程案例。",
-    "希臘神話中『奧林帕斯敘事』與近東洪水神話的父權/秩序主題如何互文？比較兩則。",
-    "以『敘層/時距/內在獨白』，說明《尤利西斯》一天結構與讀者認知負荷的關係。",
-    "《罪與罰》內的『階層/罪/救贖』三語彙在主角自我辯證中如何重疊？用三段內在獨白路徑說明。",
-    "《紅樓夢》『千頭萬緒一絲牽』：選三個重複出現的物件母題，寫出象徵迴路與敘事功能。",
-    "現代主義的『碎片』是美學還是認識論立場？以立體派畫作空間觀+一段文學敘事佐證。",
-    "日本『物哀』在《源氏物語》的季節語與人物命運的對位關係；與俳句『季語』的差異。",
-    "從戲劇衝突類型 (人/人、人/自然、人/自我) 歸納《李爾王》的三條悲劇軸。",
-    # 數學、邏輯、資訊理論 (23-32)
-    "在 ε-δ 定式下，敘述一致連續與普通連續的差別；給一個 [0,1) 上連續但不一致連續的例子並證。",
-    "說明黎曼猜想與非平凡零點的關聯，並寫出若其成立/不成立，對素數篩與公鑰體制可能產生的『機率式』風險。",
-    "比較 RSA 與 ECC 的『硬問題』、金鑰長度/效能權衡；在 IoT 上為何多選 ECC。",
-    "在『七橋』與『單筆劃』之間，尤拉度數條件是什麼？如何推廣到方向圖？",
-    "重複賽局中的子賽局完美納許均衡是什麼？用囚徒困境兩階段說明。",
-    "在黎曼流形上，測地線作為最短路徑的變分原理如何連到廣相中的自由落體。",
-    "在因果推斷，『混淆因子』與『中介』如何區分？畫兩個 DAG 並寫可識別性條件。",
-    "說明費波那契遞迴的矩陣快速冪、與以特徵值表示封閉式兩法，並比較數值穩定度。",
-    "Lorenz 系統的『奇怪吸引子』是什麼？指出初始值如何影響可預測時間窗。",
-    "哥德爾第一不完備性定理的『可表達性』關卡是什麼？第二定理再加哪個技術要點？",
-    # 哲學、政治、倫理 (33-40)
-    "在自動駕駛傷害極小化原則下，權重應是義務論還是效益主義參數？各給兩則可操作的設計。",
-    "孟荀人性論分歧如何導出不同的教育/政治設計？與法家『性惡+賞罰』比較。",
-    "沙特『他人即地獄』與卡繆的『荒謬』是同一層的診斷嗎？從自由與敘事兩面回答。",
-    "從實在論與建構主義的『客觀性』觀，討論科學共識與可重複實驗的哲學地位。",
-    "『電車難題』的模型若加入法律責任歸屬，道德直覺會如何位移？用兩層分類討論。",
-    "尼采『永劫回歸』作為一種價值測試：其與當下『長期主義』敘事有何衝突？",
-    "霍布斯/洛克/盧梭的自然狀態敘事各預排了什麼『人性參數』，因而導出不同主權正當性？",
-    "馬克思的『異化』在零工經濟/平台勞動上是否以新形態出現？舉三則。",
-    # 歷史、文明、地緣 (41-48)
-    "英國工業革命：煤、專利、紡織、金融四要素如何互相鎖釦，而非單一『蒸汽』神話。",
-    "從階級、財產、民族三線，讀 1789 年法國的『權利』語彙變遷。",
-    "白銀、邊遠軍費、白銀貨幣化如何一起擠壓明後期的財政倫理？",
-    "太空競賽與導彈技術/輿論/核嚇阻，如何同軌進行。",
-    "文藝復興的『人』如何同時是解剖學主體與金融城市公民？以佛羅倫斯為例。",
-    "以官僚體/灌溉/宗教三軸，比較埃及與美索不達米亞的早期國家。",
-    "一戰的『戰前連鎖承諾』如何使局部衝突變成陣營戰，繪簡圖+文字。",
-    "絲路：不談浪漫敘事，用『節點/稅/宗教移動/疾病』寫一段冷靜的宏觀。",
-    # 社會、心理、經濟 (49-52)
-    "CBT 的『核心信念—自動化思考—行為實驗』鏈，如何針對災難化思維設計。",
-    "從帳戶/清算/最後貸款人三層，比較法幣、穩定幣、央行數位貨幣的風險圖。",
-    "從眾/服從兩實驗的倫理爭議與外部效度批評。",
-    "新古典貿易理論的『假設地』與產業政策現實，如何讓『比較利益』在政治上失靈。",
-    # 程式、演算法、系統 (53-80)
-    "實作一個帶 capacity 的 LRU 快取（get/put 均 O(1)）。請用 Python 3 寫出完整 class，雙向鏈表+雜湊，並在 docstring 說明為何刪最久未用。",
-    "在 Python 3 實作一個執行緒安全的、固定視窗的 token-bucket 限流器；說明 race 的修補，並示範 async 下如何包裝。",
-    "給出一段有 race 的 bank transfer 偽代碼，用 threading.Lock 與一個用 queue 的設計兩修；比較死鎖風險。",
-    "在無權圖上，從 s 到 t 列舉最短路徑的條件；有負權時 Dijkstra 何時失效、改用 Bellman-Ford/Johnson 的判準。",
-    "寫出 PostgreSQL 查詢：有 orders(user_id, amount, ts) 與 users(id, region)，要每 region 內、按 amount 的累計排名與 7 日滾動合計。",
-    "從併發模型比較 HTTP/1.1 管線、HTTP/2 多工、gRPC/HTTP-2 的 HOL blocking 風險。",
-    "在分散式中敘述 CAP 與實務系統 (Spanner, Cassandra, 單一 Redis) 的取捨；指出 PACELC 補足什麼。",
-    "用 Python 3 的 dataclass + typing 寫一個可恢復的 JSON 巢狀讀取器，遇到型別錯誤要返回路徑與可讀訊息。",
-    "說明 property-based (Hypothesis) 測試與手寫用例的互補；以排序函式設計兩則不變性。",
-    "給一個多階段 Dockerfile 範例 (Python 服務)；說明每階段減面與掃毒掃依賴的點。",
-    "OWASP 2021 API Top 10 中，挑三則 (object auth, BOLA, 過度資料暴露)，各寫一條可部署的防線 (middleware/策略) 。",
-    "在 React 的 concurrent rendering 敘事下，說明 startTransition 與 Suspense 如何改讀寫衝突。",
-    "用 asyncio 寫一個有界佇列生產者—消費者，示範背壓 (backpressure) 與取消。",
-    "讀寫者鎖的寫飢餓風險，給兩個公平化策略的偽代碼。",
-    "描述編譯器前端的 lexer/parser 分工、AST 的型別屬性綜掃與一個常見的語法糖降階。",
-    "C++ 的 memory order (relaxed/acquire-release/seq_cst) 各適合哪類無鎖佇列場景。",
-    "在微服務中，比較 Sagas (編舞/編排) 與 2PC 的可用性；寫一個下單/扣庫存的失補路徑。",
-    "在 Django/FastAPI 風格各一段，寫一個帶 Pydantic 驗證的 POST，錯誤要結構化回傳。",
-    "用一個圖的鄰接表，在 Python 3 寫 DFS/BFS 模板，印出從 s 的 layer。",
-    "給一個遞迴斐波那契的效能陷阱，用 memoization+迭代兩法修正。",
-    "在『上帝類』服務中，如何按聚合根拆到應用服務+領域事件？給重構前後的目錄樹。",
-    "在 Git 上比較 rebase 與 merge 的歷史圖、何時 rebase 會改寫遠端協作者的工作；給團隊規範。",
-    "在 Linux 上如何 strace/perf 一個 P99 延遲飆高的 Python 服務，列出 5 個檢查點。",
-    "在 SQL 寫一個 CTE 遞迴產生組織樹的 depth 與路徑字串。",
-    "在 Python 3 寫 contextmanager 做 redis lock with lease，避免死鎖。",
-    "比較 TLS 1.2/1.3 交握回合差異與 0-RTT 的 replay 風險。",
-    "在瀏覽器端，CSP, SameSite, Subresource integrity 三者的防禦層分別擋什麼。",
-    "在 PyTorch/概念層，說明 autograd 圖、in-place 與版本計數的關聯。",
-    "設計一個即時聊天室 (WebSocket)：分片/房間/水平擴展、訊息序與冪等 key。",
-]
+
+def _freeze_prompt_bank() -> tuple[str, ...]:
+    path = pathlib.Path(__file__).with_name("test_max_tps_topics_64.txt")
+    if not path.is_file():
+        raise FileNotFoundError(f"題庫檔遺失: {path}")
+    lines = tuple(
+        ln.strip()
+        for ln in path.read_text(encoding="utf-8").splitlines()
+        if ln.strip() and not ln.lstrip().startswith("#")
+    )
+    if len(lines) != 64:
+        raise RuntimeError(f"題庫須為 64 題幹（目前 {len(lines)}）：{path}")
+    suff = (
+        " 【作答強制】須含：⑴明列範疇／假設／非目標；⑵三段以上分段小標推進；⑶至少一例反例／邊界／不確定性；"
+        "⑷數字結論或核對清單。程式／SQL／數學須附上可檢視之具體片段並註複雜度。"
+    )
+    return tuple(s + suff for s in lines)
+
+
+_CURRENT_RUN_PROMPTS: list[str] = []
+
+# 題庫 64 題（檔：`test_max_tps_topics_64.txt`）。每輪依併發數 k 對題庫做 random.sample(_, k)，題目不重复。
+_PROMPT_BANK: tuple[str, ...] = _freeze_prompt_bank()
+PROMPTS = _PROMPT_BANK
+
+
+def prepare_prompts_for_run() -> str:
+    """自題庫抽樣，寫入 _CURRENT_RUN_PROMPTS；回傳 Markdown 題庫表列（無外層標題）。"""
+    global _CURRENT_RUN_PROMPTS
+    n = CONCURRENT_REQUESTS
+    nb = len(_PROMPT_BANK)
+    if n > nb:
+        print(
+            f"❌ 併發數 **{n}** 超過題庫 **{nb}** 題，無法不重複抽樣。"
+            " 請調低 -c／VLLM_CONCURRENT。",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    raw = os.environ.get("VLLM_PROMPT_SEED", "").strip()
+    try:
+        if raw != "":
+            rng = random.Random(int(raw))
+            seed_note = repr(raw)
+        else:
+            rng = random.Random()
+            seed_note = "未設定 **VLLM_PROMPT_SEED**（每次執行獨立隨機）"
+    except ValueError:
+        print(f"❌ 環境變數 VLLM_PROMPT_SEED 須為整數字串，目前為 {raw!r}。", file=sys.stderr)
+        sys.exit(2)
+    _CURRENT_RUN_PROMPTS[:] = rng.sample(list(_PROMPT_BANK), n)
+    rows = "| 項目 | 內容 |\n|:--|:--|\n"
+    rows += f"| 題庫規模（檔：`test_max_tps_topics_64.txt`） | **{nb}** 題高複合模版 |\n"
+    rows += f"| 本輪抽題 | **{n}**（`random.sample`、不重複） |\n"
+    rows += f"| 隨機種子 | {seed_note} |\n"
+    return rows
+
 
 
 def _format_ctx_line(info: dict) -> str:
@@ -628,6 +799,10 @@ def _format_summary_markdown(
     max_tokens_note: str,
     temperature: float,
     top_p: float,
+    presence_penalty: float,
+    use_streaming: bool,
+    generation_timeout_sec: float,
+    n_generation_timeout: int,
     v1_info: dict,
     n_ok: int,
     total_time: float,
@@ -637,6 +812,7 @@ def _format_summary_markdown(
     system_tps: float,
     avg_in: float,
     avg_out: float,
+    prompt_sampling_md: str = "",
 ) -> str:
     mlen = v1_info.get("max_model_len")
     mlen_disp = str(mlen) if mlen is not None else "未知"
@@ -647,9 +823,15 @@ def _format_summary_markdown(
     if n_ok:
         avg_blurb = f"平均每則：prompt ≈ **{avg_in:,.1f}** ｜ completion ≈ **{avg_out:,.1f}** tokens。"
 
+    bank_block = ""
+    if prompt_sampling_md.strip():
+        bank_block = f"### 題庫與抽樣\n\n{prompt_sampling_md.strip()}\n\n---\n\n"
+
+    stream_label = "是（SSE）" if use_streaming else "否"
+
     return f"""## 執行摘要
 
-> **本輪重點：** **{concurrent_requests}** 路併發、牆鐘 **{total_time:,.2f} s**，以 **completion_tokens** 計之系統吞吐量 **{system_tps:,.2f} tok/s**；成功請求 **{ok_line}**（{pct_ok:.0f}%）。
+> **本輪重點：** **{concurrent_requests}** 路併發、**總耗時** **{total_time:,.2f} s**，以 **completion_tokens** 計之系統吞吐量 **{system_tps:,.2f} tok/s**；成功請求 **{ok_line}**（{pct_ok:.0f}%）。
 
 ---
 
@@ -658,7 +840,7 @@ def _format_summary_markdown(
 | 指標 | 數值 |
 |:--|--:|
 | **Token 吞吐量（TPS）** | **{system_tps:,.2f}** tokens/s |
-| 牆鐘總耗時 | {total_time:,.2f} s |
+| 總耗時 | {total_time:,.2f} s |
 | 成功請求 | {ok_line} |
 | 輸入 prompt_tokens（累計） | {total_prompt:,} |
 | 輸出 completion_tokens（累計） | **{total_completion:,}** |
@@ -667,8 +849,7 @@ def _format_summary_markdown(
 {avg_blurb}
 
 ---
-
-### 連線與模型
+{bank_block}### 連線與模型
 
 | 項目 | 內容 |
 |:--|:--|
@@ -688,6 +869,10 @@ def _format_summary_markdown(
 | max_tokens 決策說明 | {max_tokens_note or "—"} |
 | temperature | {temperature:g} |
 | top_p | {top_p:g} |
+| presence_penalty | {presence_penalty:g}（建議 0.1～0.5 降低重複循環）|
+| stream | **{stream_label}**（逾時會中止該請求並寫入報告）|
+| 單請求產出門檻 | **{generation_timeout_sec:g}** s（`VLLM_STREAM_GENERATION_TIMEOUT`）|
+| 逾時中止 | **{n_generation_timeout}**／{concurrent_requests} |
 
 """
 
@@ -701,6 +886,10 @@ def _print_run_summary_terminal(
     max_tokens_note: str,
     temperature: float,
     top_p: float,
+    presence_penalty: float,
+    use_streaming: bool,
+    generation_timeout_sec: float,
+    n_generation_timeout: int,
     v1_info: dict,
     n_ok: int,
     total_time: float,
@@ -710,6 +899,7 @@ def _print_run_summary_terminal(
     system_tps: float,
     avg_in: float,
     avg_out: float,
+    prompt_sampling_note: str = "",
 ) -> None:
     """終端機用：框線 + ANSI 強調主要指標。"""
     mlen = v1_info.get("max_model_len")
@@ -738,7 +928,7 @@ def _print_run_summary_terminal(
     print(f"  {B}▸ 執行摘要｜Token 產能{RST}")
     print(f"{C}{bar}{RST}")
     print(row("TPS (completion)", f"{R}{B}{system_tps:,.2f}{RST} tok/s"))
-    print(row("牆鐘時間", f"{total_time:,.2f} s"))
+    print(row("總耗時", f"{total_time:,.2f} s"))
     print(row("成功請求", f"{n_ok} / {concurrent_requests}"))
     print(row("prompt Σ", f"{total_prompt:,}"))
     print(row("completion Σ", f"{G}{total_completion:,}{RST}"))
@@ -754,32 +944,119 @@ def _print_run_summary_terminal(
     if max_tokens_note.strip():
         plain = clip(max_tokens_note.replace("`", "").replace("**", ""))
         print(row("max_tokens 說明", f"{plain}"))
+    if prompt_sampling_note.strip():
+        pn = clip(prompt_sampling_note.replace("`", "").replace("**", "").replace("|", " "))
+        print(row("題庫抽樣", pn))
     print(row("temperature∕top_p", f"{temperature:g} / {top_p:g}"))
+    print(row("presence_penalty", f"{presence_penalty:g}"))
+    print(row("stream", "SSE 開" if use_streaming else "關"))
+    print(
+        row(
+            "產出門檻／逾時",
+            f"{generation_timeout_sec:g}s ｜ {n_generation_timeout}/{concurrent_requests} 則中止",
+        )
+    )
     print(f"{C}{bar}{RST}")
     print("")
 
 
-async def fetch(session, request_id):
-    # 併發請求輪流使用 PROMPTS，題目數量建議 >= 併發數
-    prompt = PROMPTS[request_id % len(PROMPTS)]
-    
+async def _consume_sse_chat_completion(
+    response: aiohttp.ClientResponse,
+    *,
+    deadline_sec: float,
+    request_id: int,
+    dashboard: "_ConcurrentStreamDashboard | None" = None,
+) -> tuple[str, dict]:
+    """解析 OpenAI 相容 chat completions 的 SSE。
+    Wall-clock `deadline_sec` 涵蓋等候下一資料列（含首包與資料列間空隙），逾時則 StreamGenerationTimeout。
+    """
+    content_parts: list[str] = []
+    usage: dict = {}
+    t0 = time.monotonic()
+
+    while True:
+        elapsed = time.monotonic() - t0
+        if elapsed >= deadline_sec:
+            raise StreamGenerationTimeout(
+                elapsed_sec=elapsed,
+                deadline_sec=deadline_sec,
+                partial_content="".join(content_parts),
+                usage=usage,
+            )
+        remain = max(1e-3, deadline_sec - elapsed)
+        try:
+            raw = await asyncio.wait_for(response.content.readline(), timeout=remain)
+        except asyncio.TimeoutError:
+            elapsed = time.monotonic() - t0
+            raise StreamGenerationTimeout(
+                elapsed_sec=elapsed,
+                deadline_sec=deadline_sec,
+                partial_content="".join(content_parts),
+                usage=usage,
+            ) from None
+
+        if raw == b"":
+            break
+
+        line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
+        line_stripped = line.strip()
+        if not line_stripped or line_stripped.startswith(":"):
+            continue
+        if not line_stripped.startswith("data:"):
+            continue
+        payload = line_stripped[5:].strip()
+        if payload == "[DONE]":
+            continue
+        try:
+            obj = json.loads(payload)
+        except json.JSONDecodeError:
+            continue
+        u = obj.get("usage")
+        if isinstance(u, dict) and u:
+            usage = {**usage, **u}
+        choices = obj.get("choices") or []
+        if choices and isinstance(choices[0], dict):
+            delta = choices[0].get("delta") or {}
+            if isinstance(delta, dict):
+                piece = delta.get("content")
+                if piece:
+                    content_parts.append(piece)
+                    if dashboard is not None:
+                        await dashboard.append_piece(request_id, piece)
+
+    return "".join(content_parts), usage
+
+
+async def fetch(session, request_id: int, dashboard: "_ConcurrentStreamDashboard | None" = None):
+    prompt = _CURRENT_RUN_PROMPTS[request_id]
+
     data = {
         "model": CHAT_MODEL,
         "messages": [
             {"role": "system", "content": CHAT_SYSTEM_PROMPT},
-            {"role": "user", "content": prompt}
+            {"role": "user", "content": prompt},
         ],
         "max_tokens": MAX_TOKENS,
         "temperature": SAMPLING_TEMPERATURE,
         "top_p": SAMPLING_TOP_P,
+        "presence_penalty": SAMPLING_PRESENCE_PENALTY,
     }
-    
+    if USE_STREAMING:
+        data["stream"] = True
+        data["stream_options"] = {"include_usage": True}
+
     start_time = time.time()
+    if dashboard is not None:
+        await dashboard.set_status(request_id, "發送請求…")
     try:
         async with session.post(URL, headers=HEADERS, json=data) as response:
             if response.status != 200:
                 error_text = await response.text()
                 print(f"請求 {request_id} 失敗 (HTTP {response.status}): {error_text}")
+                if dashboard is not None:
+                    await dashboard.mark_terminal(
+                        request_id, f"失敗 HTTP {response.status}"
+                    )
                 return {
                     "id": request_id,
                     "prompt": prompt,
@@ -790,20 +1067,101 @@ async def fetch(session, request_id):
                     "time": 0,
                     "success": False,
                 }
-                
-            result = await response.json()
-            end_time = time.time()
-            
-            # 處理 OpenAI 相容格式的回傳值
-            content = ""
-            usage = result.get("usage") or {}
-            completion_tokens = int(usage.get("completion_tokens", 0) or 0)
-            prompt_tokens = int(usage.get("prompt_tokens", 0) or 0)
-            total_tokens = int(usage.get("total_tokens", 0) or 0)
-            
-            if "choices" in result and len(result["choices"]) > 0:
-                content = result["choices"][0].get("message", {}).get("content", "")
-            
+
+            if USE_STREAMING:
+                if dashboard is not None:
+                    await dashboard.set_status(request_id, "等待 SSE token…")
+                try:
+                    content, usage = await _consume_sse_chat_completion(
+                        response,
+                        deadline_sec=STREAM_GENERATION_TIMEOUT_SEC,
+                        request_id=request_id,
+                        dashboard=dashboard,
+                    )
+                except StreamGenerationTimeout as e:
+                    end_time = time.time()
+                    pct = e.partial_content
+                    use = e.usage
+                    completion_tokens = int(use.get("completion_tokens", 0) or 0)
+                    prompt_tokens = int(use.get("prompt_tokens", 0) or 0)
+                    total_tokens = int(use.get("total_tokens", 0) or 0)
+                    if completion_tokens == 0 and pct:
+                        completion_tokens = max(1, int(len(pct) / 3.5))
+                    if total_tokens == 0 and (prompt_tokens or completion_tokens):
+                        total_tokens = prompt_tokens + completion_tokens
+                    print(
+                        f"請求 {request_id} SSE 逾時（門檻 {STREAM_GENERATION_TIMEOUT_SEC:g}s，"
+                        f"已讀 {e.elapsed_sec:.2f}s）：已終止連線並記錄部份輸出"
+                    )
+                    if dashboard is not None:
+                        await dashboard.set_response_preview(request_id, pct)
+                        await dashboard.mark_terminal(request_id, "SSE 逾時（已錄片段）")
+                    return {
+                        "id": request_id,
+                        "prompt": prompt,
+                        "content": pct,
+                        "tokens": completion_tokens,
+                        "prompt_tokens": prompt_tokens,
+                        "total_tokens": total_tokens,
+                        "time": end_time - start_time,
+                        "success": False,
+                        "abort_reason": "stream_timeout",
+                        "deadline_sec": STREAM_GENERATION_TIMEOUT_SEC,
+                    }
+
+                end_time = time.time()
+                completion_tokens = int(usage.get("completion_tokens", 0) or 0)
+                prompt_tokens = int(usage.get("prompt_tokens", 0) or 0)
+                total_tokens = int(usage.get("total_tokens", 0) or 0)
+                if completion_tokens == 0 and content:
+                    completion_tokens = max(1, int(len(content) / 3.5))
+                if total_tokens == 0 and (prompt_tokens or completion_tokens):
+                    total_tokens = prompt_tokens + completion_tokens
+                if dashboard is not None:
+                    await dashboard.set_response_preview(request_id, content)
+                    await dashboard.mark_terminal(request_id, "完成")
+            else:
+                if dashboard is not None:
+                    await dashboard.set_status(request_id, "非 SSE · 等候 JSON …")
+                try:
+                    result = await asyncio.wait_for(
+                        response.json(),
+                        timeout=STREAM_GENERATION_TIMEOUT_SEC,
+                    )
+                except asyncio.TimeoutError:
+                    end_time = time.time()
+                    print(
+                        f"請求 {request_id} 非流式讀取逾時（≥{STREAM_GENERATION_TIMEOUT_SEC:g}s）："
+                        "已中止並記錄"
+                    )
+                    if dashboard is not None:
+                        await dashboard.mark_terminal(request_id, "非 SSE 逾時")
+                    return {
+                        "id": request_id,
+                        "prompt": prompt,
+                        "content": "",
+                        "tokens": 0,
+                        "prompt_tokens": 0,
+                        "total_tokens": 0,
+                        "time": end_time - start_time,
+                        "success": False,
+                        "abort_reason": "nonstream_read_timeout",
+                        "deadline_sec": STREAM_GENERATION_TIMEOUT_SEC,
+                    }
+                end_time = time.time()
+                content = ""
+                usage = result.get("usage") or {}
+                completion_tokens = int(usage.get("completion_tokens", 0) or 0)
+                prompt_tokens = int(usage.get("prompt_tokens", 0) or 0)
+                total_tokens = int(usage.get("total_tokens", 0) or 0)
+
+                if "choices" in result and len(result["choices"]) > 0:
+                    content = result["choices"][0].get("message", {}).get("content", "")
+
+                if dashboard is not None:
+                    await dashboard.set_response_preview(request_id, content or "")
+                    await dashboard.mark_terminal(request_id, "完成（非 SSE）")
+
             return {
                 "id": request_id,
                 "prompt": prompt,
@@ -812,10 +1170,12 @@ async def fetch(session, request_id):
                 "prompt_tokens": prompt_tokens,
                 "total_tokens": total_tokens,
                 "time": end_time - start_time,
-                "success": True
+                "success": True,
             }
     except Exception as e:
         print(f"請求 {request_id} 失敗: {e}")
+        if dashboard is not None:
+            await dashboard.mark_terminal(request_id, f"異常 · {type(e).__name__}")
         return {
             "id": request_id,
             "prompt": prompt,
@@ -845,14 +1205,17 @@ async def main(skip_preflight: bool = False, model_override=None) -> None:
             if suf_ctx:
                 _MAX_TOKENS_NOTE += suf_ctx
 
+        prompt_sampling_md = prepare_prompts_for_run()
+
         print("=====================================================")
         print(f"端點: {URL}  |  model 欄位: {CHAT_MODEL}")
         print(
             f"🔥 開始效能測試—token 產能 (併發: {CONCURRENT_REQUESTS}, max_tokens: {MAX_TOKENS}, "
-            f"temperature: {SAMPLING_TEMPERATURE}, top_p: {SAMPLING_TOP_P})"
+            f"temperature: {SAMPLING_TEMPERATURE}, top_p: {SAMPLING_TOP_P}, "
+            f"presence_penalty: {SAMPLING_PRESENCE_PENALTY}, stream: {USE_STREAMING})"
         )
-        print("📚 模式：高複雜度提問（科學、人文、程式與系統等）＋角色扮演型 system prompt")
-        print("🎯 指標：牆鐘時間內輸出的 completion_tokens 總量 → 系統 TPS（預設 16 路併發）")
+        print("📚 模式：題庫 64 題高複合度；本輪自題庫隨機抽「併發數」題且不重複，外加角色扮演 system")
+        print("🎯 指標：總耗時期間內輸出之 completion_tokens 總量 ÷ 總耗時 → 系統 TPS（預設 16 路併發）")
         print("💡 提示：測試期間請在另一個終端機執行 `watch -n 1 nvidia-smi`")
         print("=====================================================")
         _sp_one = CHAT_SYSTEM_PROMPT.replace("\n", " ").strip()
@@ -860,12 +1223,62 @@ async def main(skip_preflight: bool = False, model_override=None) -> None:
         print(f"📜 system（節錄）: {_pv}")
         print(f"📐 伺服器 context 上界: {_format_ctx_line(v1_info)}")
         print(
-            f"📐 本輪請求: max_tokens={MAX_TOKENS}, temperature={SAMPLING_TEMPERATURE}, top_p={SAMPLING_TOP_P}"
+            f"🎲 抽樣：題庫 64 題，本輪 {CONCURRENT_REQUESTS} 題（random.sample、無重複）；"
+            "環境變數 VLLM_PROMPT_SEED=整數 可固定抽題。"
         )
-        tasks = [fetch(session, i) for i in range(CONCURRENT_REQUESTS)]
-        results = await asyncio.gather(*tasks)
+        print(
+            f"📐 本輪請求: max_tokens={MAX_TOKENS}, temperature={SAMPLING_TEMPERATURE}, "
+            f"top_p={SAMPLING_TOP_P}, presence_penalty={SAMPLING_PRESENCE_PENALTY}, "
+            f"stream={'SSE' if USE_STREAMING else 'off'}"
+        )
+        print(
+            f"⏱️ 單請求產出門檻：**{STREAM_GENERATION_TIMEOUT_SEC:g}** s "
+            "（SSE 自開始收 body 計時；逾時終止該請求並寫入報告，`VLLM_STREAM_GENERATION_TIMEOUT` 可調；"
+            "`--no-stream` 時以同門檻包 `wait_for(JSON)`）。"
+        )
+        sse_dash = (
+            _ConcurrentStreamDashboard(CONCURRENT_REQUESTS)
+            if _want_rich_sse_dashboard(USE_STREAMING)
+            else None
+        )
+        if sse_dash is not None:
+            print(
+                "📺 [Rich Live] 即時更新各路請求之 SSE delta 與累積尾段（"
+                "`VLLM_RICH_LIVE=0`、`--no-rich-live`、或非 TTY 則停用）"
+            )
+            console = Console()
+            opener = Panel(
+                Text.from_markup("[bold]併發測試進行中[/bold]，下方每格對應一個 request id"),
+                subtitle="subtitle 顯示剛收到的片段；正文為總輸出之尾部預覽",
+                border_style="green",
+            )
+            with Live(
+                opener,
+                console=console,
+                transient=True,
+                refresh_per_second=20,
+                vertical_overflow="visible",
+            ) as rich_live:
+                sse_dash.bind_live(rich_live)
+                await sse_dash._paint_async()
+                results = await asyncio.gather(
+                    *[
+                        fetch(session, rid, dashboard=sse_dash)
+                        for rid in range(CONCURRENT_REQUESTS)
+                    ]
+                )
+                sse_dash.bind_live(None)
+        else:
+            results = await asyncio.gather(
+                *[fetch(session, rid) for rid in range(CONCURRENT_REQUESTS)]
+            )
 
     total_time = time.time() - start_time
+    n_generation_timeout = sum(
+        1
+        for r in results
+        if r.get("abort_reason") in ("stream_timeout", "nonstream_read_timeout")
+    )
     
     # 統計結果
     successful_results = [r for r in results if r["success"]]
@@ -890,6 +1303,10 @@ async def main(skip_preflight: bool = False, model_override=None) -> None:
         max_tokens_note=_MAX_TOKENS_NOTE,
         temperature=SAMPLING_TEMPERATURE,
         top_p=SAMPLING_TOP_P,
+        presence_penalty=SAMPLING_PRESENCE_PENALTY,
+        use_streaming=USE_STREAMING,
+        generation_timeout_sec=STREAM_GENERATION_TIMEOUT_SEC,
+        n_generation_timeout=n_generation_timeout,
         v1_info=v1_info,
         n_ok=n_ok,
         total_time=total_time,
@@ -899,10 +1316,8 @@ async def main(skip_preflight: bool = False, model_override=None) -> None:
         system_tps=system_tps,
         avg_in=avg_in,
         avg_out=avg_out,
+        prompt_sampling_note=f"64 題庫／{CONCURRENT_REQUESTS} 題無重複",
     )
-    print("=====================================================")
-
-    log_filename = _reports_max_tps_md_path()
     system_info_md = get_system_info()
     md_head = _format_summary_markdown(
         llm_base=_LLM_BASE,
@@ -912,6 +1327,10 @@ async def main(skip_preflight: bool = False, model_override=None) -> None:
         max_tokens_note=_MAX_TOKENS_NOTE,
         temperature=SAMPLING_TEMPERATURE,
         top_p=SAMPLING_TOP_P,
+        presence_penalty=SAMPLING_PRESENCE_PENALTY,
+        use_streaming=USE_STREAMING,
+        generation_timeout_sec=STREAM_GENERATION_TIMEOUT_SEC,
+        n_generation_timeout=n_generation_timeout,
         v1_info=v1_info,
         n_ok=n_ok,
         total_time=total_time,
@@ -921,8 +1340,10 @@ async def main(skip_preflight: bool = False, model_override=None) -> None:
         system_tps=system_tps,
         avg_in=avg_in,
         avg_out=avg_out,
+        prompt_sampling_md=prompt_sampling_md,
     )
 
+    log_filename = _reports_max_tps_md_path()
     with open(log_filename, "w", encoding="utf-8") as f:
         f.write("# Token 產能／併發測試結果日誌\n\n")
         f.write("## System prompt（角色扮演）\n\n")
@@ -930,7 +1351,7 @@ async def main(skip_preflight: bool = False, model_override=None) -> None:
         f.write(md_head)
         f.write(f"{system_info_md}\n\n---\n\n")
         
-        for r in results:
+        for r in sorted(results, key=lambda x: x["id"]):
             if r["success"]:
                 f.write(f"## 請求編號: {r['id']}\n")
                 f.write(f"- **耗時:** {r['time']:.2f} 秒\n")
@@ -942,6 +1363,40 @@ async def main(skip_preflight: bool = False, model_override=None) -> None:
                 f.write(f"### 提問 (Prompt)\n> {r['prompt']}\n\n")
                 f.write(f"### 模型回答 (Response)\n{r['content']}\n\n")
                 f.write("---\n\n")
+                continue
+            ar = r.get("abort_reason")
+            dl = float(r.get("deadline_sec", STREAM_GENERATION_TIMEOUT_SEC))
+            if ar == "stream_timeout":
+                f.write(f"## 請求編號: {r['id']}（⚠️ SSE 逾時中斷）\n\n")
+                f.write(
+                    f"- **狀態:** 達 **{dl:g}** s 產出門檻仍未完整收完 SSE；已終止連線。\n"
+                )
+                f.write(f"- **耗時:** {r['time']:.2f} 秒（自送出請求起算）\n")
+                f.write(
+                    f"- **估計／回報 tokens：** prompt_tokens≈**{r.get('prompt_tokens', 0)}** ｜ "
+                    f"completion_tokens≈**{r['tokens']}** ｜ total_tokens≈**{r.get('total_tokens', 0)}**\n\n"
+                )
+                f.write(f"### 提問 (Prompt)\n> {r['prompt']}\n\n")
+                pc = r.get("content") or ""
+                f.write(f"### 截至中斷前之模型輸出（片段）\n{pc}\n\n")
+                f.write("---\n\n")
+                continue
+            if ar == "nonstream_read_timeout":
+                f.write(f"## 請求編號: {r['id']}（⚠️ 非流式逾時）\n\n")
+                f.write(
+                    f"- **狀態:** **{dl:g}** s 內未讀完整份 JSON；已中止。\n"
+                )
+                f.write(f"- **耗時:** {r['time']:.2f} 秒\n\n")
+                f.write(f"### 提問 (Prompt)\n> {r['prompt']}\n\n")
+                f.write("---\n\n")
+                continue
+            f.write(f"## 請求編號: {r['id']}（失敗）\n\n")
+            f.write("- **狀態:** 請求未成功完成（請一併對照終端錯誤訊息）。\n")
+            if r.get("time", 0) > 0:
+                f.write(f"- **耗時:** {r['time']:.2f} 秒\n")
+            f.write("\n")
+            f.write(f"### 提問 (Prompt)\n> {r['prompt']}\n\n")
+            f.write("---\n\n")
                 
     print(f"📄 生成的問答內容已完整寫入日誌檔: \033[93m{log_filename}\033[0m")
     print("您可以開啟該檔案來檢視模型在併發下的吞吐與回答內容。")

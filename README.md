@@ -89,7 +89,7 @@ GEMMA_MODEL_ID=nvidia/Gemma-4-9B-IT-NVFP4 ./start_vllm_server_gemma-4-31b-it-nvf
 **腳本：** `start_vllm_server_llama_31b.sh`
 
 ```bash
-# 使用預設 nvidia/Llama-3.1-8B-Instruct-NVFP4
+# 使用預設 nvidia/Llama-3.1-8B-Instruct-NVFP4（長文預設 max-model-len 64K）
 ./start_vllm_server_llama_31b.sh
 
 # 切換為 70B FP8 版本
@@ -105,9 +105,10 @@ LLAMA_MODEL_ID=nvidia/Llama-3.1-405B-Instruct-NVFP4 ./start_vllm_server_llama_31
 |----------|--------|------|
 | `LLAMA_MODEL_ID` | `nvidia/Llama-3.1-8B-Instruct-NVFP4` | 模型 repo |
 | `VLLM_API_PORT` | `8001` | HTTP 埠（與 Gemma 分開）|
-| `GPU_MEMORY_UTILIZATION` | `0.85` | GPU 記憶體使用率 |
-| `VLLM_MAX_MODEL_LEN` | `16384` | 最大 context 長度 |
-| `VLLM_QUANTIZATION` | `""` | 量化格式（`nvfp4` / `fp8` / 留空）|
+| `GPU_MEMORY_UTILIZATION` | `0.55` | GPU 記憶體使用率（獨占卡可提高）|
+| `VLLM_MAX_MODEL_LEN` | `65536` | 最大 context 長度（64K；較短可設 `32768`）|
+| `VLLM_MAX_NUM_SEQS` | `32` | 最大同時序列數（`--max-num-seqs`）|
+| `VLLM_QUANTIZATION` | `nvfp4`（依 `MODEL_ID` 自動）| Llama 3.3 NVFP4 需 `modelopt_fp4`，見腳本註解 |
 
 ---
 
