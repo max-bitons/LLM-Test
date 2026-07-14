@@ -58,25 +58,28 @@ hf auth login
 
 ## LLM 服務
 
-### 1. Gemma NVFP4 — port 8000
+### 1. Gemma 4 26B NVFP4 — port 8000
 
-**腳本：** `start_vllm_server_gemma-4-31b-it-nvfp4.sh`
+**腳本：** `start_vllm_server_gemma-4-26b-a4b-nvfp4.sh`（[nvidia/Gemma-4-26B-A4B-NVFP4](https://huggingface.co/nvidia/Gemma-4-26B-A4B-NVFP4)）
 
 ```bash
-# 使用預設 nvidia/Gemma-4-31B-IT-NVFP4
-./start_vllm_server_gemma-4-31b-it-nvfp4.sh
+./start_vllm_server_gemma-4-26b-a4b-nvfp4.sh
 
-# 覆寫模型
-GEMMA_MODEL_ID=nvidia/Gemma-4-9B-IT-NVFP4 ./start_vllm_server_gemma-4-31b-it-nvfp4.sh
+# 覆寫為其他 NVFP4 檢查點範例
+GEMMA_MODEL_ID=nvidia/Gemma-4-31B-IT-NVFP4 ./start_vllm_server_gemma-4-26b-a4b-nvfp4.sh
 ```
+
+預設：**可見 GPU ≥2 張時 TP=2**（模型卡常以 TP=1 為準；遇問題可強制設 `VLLM_TENSOR_PARALLEL_SIZE=1`）；**TurboQuant KV**（`turboquant_k8v4`）；**`gemma4` tool／reasoning parser**（若 CLI 支援）。
 
 | 環境變數 | 預設值 | 說明 |
 |----------|--------|------|
-| `GEMMA_MODEL_ID` | `nvidia/Gemma-4-31B-IT-NVFP4` | 模型 repo |
-| `VLLM_DTYPE` | `bfloat16` | 權重精度 |
+| `GEMMA_MODEL_ID` | `nvidia/Gemma-4-26B-A4B-NVFP4` | 模型 repo |
+| `VLLM_TENSOR_PARALLEL_SIZE` | 未設定且 ≥2 GPU → `2`，否則 `1` | 單機多卡自動雙 TP；請依 vLLM 支援度調整 |
+| `VLLM_DTYPE` | `bfloat16` | NVFP4 常見計算 dtype |
 | `VLLM_QUANTIZATION` | `nvfp4` | 量化格式 |
-| `GPU_MEMORY_UTILIZATION` | `0.85` | GPU 記憶體使用率（0~1）|
-| `VLLM_MAX_MODEL_LEN` | `16384` | 最大 context 長度（tokens）|
+| `KV_CACHE_DTYPE` | `turboquant_k8v4` | KV；不支援時改 `auto` |
+| `GPU_MEMORY_UTILIZATION` | `0.82` | GPU 記憶體使用率（0~1）|
+| `VLLM_MAX_MODEL_LEN` | `32768` | 最大 context 長度（tokens）|
 | `VLLM_MAX_NUM_BATCHED_TOKENS` | `8192` | 單批次最大 tokens |
 | `VLLM_MAX_NUM_SEQS` | `8` | 同時排程序列數 |
 | `VLLM_SWAP_SPACE` | `0` | CPU KV swap 空間（GB），0 = 停用 |
@@ -348,7 +351,7 @@ python run_image_gen_safety_test.py
 
 ```
 gb100test/
-├── start_vllm_server_gemma-4-31b-it-nvfp4.sh  # Gemma NVFP4 vLLM 啟動
+├── start_vllm_server_gemma-4-26b-a4b-nvfp4.sh  # Gemma 4 26B NVFP4 vLLM
 ├── start_vllm_server_llama_31b.sh              # Llama NVFP4 vLLM 啟動
 ├── start_vllm_server_qwen3.5.sh                # Qwen 3.5 vLLM 啟動
 ├── start_image_server.sh                       # SDXL 影像生成啟動

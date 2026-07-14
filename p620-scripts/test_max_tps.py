@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import ipaddress
+import itertools
 import math
 import aiohttp
 import time
@@ -15,7 +16,7 @@ import platform
 import random
 import subprocess
 import sys
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import quote, urlparse, urlunparse
 
 try:
     from rich.console import Console, Group
@@ -29,7 +30,8 @@ except ImportError:
     Console = Group = Live = Panel = Text = None  # type: ignore
 
 _NO_RICH_LIVE_CLI_OFF = False
-_RICH_LIVE_ENV = os.environ.get("VLLM_RICH_LIVE", "1").strip().lower()
+_RICH_LIVE_CLI_ON = False
+_RICH_LIVE_ENV = os.environ.get("VLLM_RICH_LIVE", "0").strip().lower()
 
 
 def _read_stream_preview_chars(default: int = 560) -> int:
@@ -43,13 +45,15 @@ STREAM_PREVIEW_CHARS = _read_stream_preview_chars()
 
 
 def _want_rich_sse_dashboard(use_streaming: bool) -> bool:
-    """是否啟動併發 SSE 的 Rich Live 儀表板（終端機 + 有 rich + 未被 CLI 停用）。"""
+    """是否啟動併發 SSE 的 Rich Live 儀表板（預設關；`--rich-live` 或 VLLM_RICH_LIVE=1 啟用）。"""
     if not HAVE_RICH or not use_streaming:
         return False
     if not sys.stdout.isatty():
         return False
     if _NO_RICH_LIVE_CLI_OFF:
         return False
+    if _RICH_LIVE_CLI_ON:
+        return True
     return _RICH_LIVE_ENV not in ("0", "false", "no", "off")
 
 
@@ -140,7 +144,7 @@ class _ConcurrentStreamDashboard:
         hdr = Panel(
             "[bold]即時 SSE 串流面板[/bold] — Panel 正文為尾部預覽；subtitle 為狀態與上一則收到的 delta。\n"
             f"[dim]VLLM_RICH_PREVIEW_CHARS 調整尾預覽約 {STREAM_PREVIEW_CHARS} 字 · "
-            "VLLM_RICH_LIVE=0 或 --no-rich-live 關閉[/dim]",
+            "預設關閉；`--rich-live` 或 VLLM_RICH_LIVE=1 開啟[/dim]",
             border_style="magenta",
         )
         inner = Group(*rows)
@@ -228,20 +232,72 @@ def get_system_info():
     return "\n".join(info)
 
 # 測試參數設定（併發或 max_tokens 過高易 OOM，請觀察 nvidia-smi）
-_CONCURRENT = os.environ.get("VLLM_CONCURRENT", "16")
-CONCURRENT_REQUESTS = max(1, int(_CONCURRENT)) if _CONCURRENT.isdigit() else 16
+# 預設對齊 Qwen3.6-35B GGUF 壓測：**32** 併發；伺服器預設 n_ctx **16K** 時請用較短填段（run_stress 預設 8K）或自調 VLLM_PROMPT_PAD_TARGET_TOKENS。
+_CONCURRENT = os.environ.get("VLLM_CONCURRENT", "32")
+CONCURRENT_REQUESTS = max(1, int(_CONCURRENT)) if _CONCURRENT.isdigit() else 32
+# 壓力測試：多輪波次／持續秒數（由 CLI 寫入，見 apply_cli_to_globals）
+STRESS_ROUNDS = 1
+STRESS_SUSTAIN_SEC = 0.0
+# Prefix cache 命中測試（VLLM_PREFIX_CACHE_TEST=1）：第 2 波起重用第一波的完整 prompts
+# （題目與填段皆相同），量測伺服器 --enable-prefix-caching 全段命中時的 prefill 效益；
+# 波次不足 2 時自動補為 2 波。僅波次模式有效（--stress-seconds 持續模式不適用）。
+PREFIX_CACHE_TEST = os.environ.get("VLLM_PREFIX_CACHE_TEST", "0").strip().lower() in ("1", "true", "yes", "on")
 # max_tokens：預設「自動」— 取自 GET /v1/models 模型欄位後 ×110%（ceil）；再收斂至 max_model_len−輸入預留；
-# 無可用欄位則固定 16384（不重乘）。強制指定：CLI --max-tokens 優先於 VLLM_MAX_TOKENS。
+# 無可用欄位則固定 16K（不重乘）。強制指定：CLI --max-tokens 優先於 VLLM_MAX_TOKENS。
 AUTO_MAX_TOKENS_FALLBACK = 16384
 MODEL_MAX_OUTPUT_CEILING_RATIO = 1.10
+_AUTO_CAP_ENV = os.environ.get("VLLM_AUTO_MAX_TOKENS_CAP", "").strip()
+AUTO_MAX_TOKENS_CAP: int | None
+if _AUTO_CAP_ENV in ("0", "off", "none", "unlimited", "false", "no"):
+    AUTO_MAX_TOKENS_CAP = None
+elif _AUTO_CAP_ENV.isdigit():
+    AUTO_MAX_TOKENS_CAP = max(1, int(_AUTO_CAP_ENV))
+else:
+    AUTO_MAX_TOKENS_CAP = 512
+# 為 1 時：自動 max_tokens 直接採用「上下文剩餘上界」（仍受 prompt 填段估計影響）；搭配 VLLM_AUTO_MAX_TOKENS_CAP=0 可撤銷 512 硬掐
+_CCE = os.environ.get("VLLM_COMPLETION_USE_CONTEXT_CEILING", "0").strip().lower()
+COMPLETION_USE_CONTEXT_CEILING = _CCE in ("1", "true", "yes", "on")
 # vLLM／OpenAI 相容：effective prompt_tokens + max_tokens ≤ max_model_len；自動與 CLI 指定值均需預留 system＋user 權杖。
 _RST_INP = os.environ.get("VLLM_INPUT_TOKEN_RESERVE", "").strip()
-INPUT_TOKEN_RESERVE_FOR_CONTEXT = max(512, int(_RST_INP)) if _RST_INP.isdigit() else 4096
+INPUT_TOKEN_RESERVE_FOR_CONTEXT = max(512, int(_RST_INP)) if _RST_INP.isdigit() else 512
+# 長文填段由字元粗估換算 tokens，與真實 tokenizer＋chat template 常有落差；題庫題幹長度不同時可差数百 tokens。
+# 此值加在「輸入預留」上，使 max_tokens 上界滿足 prompt_tokens + max_tokens ≤ max_model_len（vLLM 會嚴格擋超長）。
+_SLACK_CTX = os.environ.get("VLLM_CONTEXT_BUDGET_SLACK_TOKENS", "640").strip()
+CONTEXT_BUDGET_SLACK_TOKENS = max(0, int(_SLACK_CTX)) if _SLACK_CTX.isdigit() else 640
+# 將 user 訊息伸長至「約 N 個 tokens」：填段以中文為主時字元數≈token 數（勿用英文常用的 3.5 字元/token）。
+# 預設約 32K 長文填段（對齊 LLAMACPP_CTX_SIZE=32768 壓測）；上下文較小或非壓測請調低 VLLM_PROMPT_PAD_TARGET_TOKENS。
+# 若伺服器實際 max_model_len（或 /props n_ctx）較小，請啟用 VLLM_AUTO_SHRINK_PROMPT_PAD（預設 1）
+# 以自動縮短填段，否則 max_tokens 常被壓成 1～數 token，TPS 失去意義。
+_PPAD = os.environ.get("VLLM_PROMPT_PAD_TARGET_TOKENS", "32768").strip()
+PROMPT_PAD_TARGET_TOKENS = max(0, int(_PPAD)) if _PPAD.isdigit() else 32768
+_PUCT = os.environ.get("VLLM_PROMPT_PAD_USER_CHARS_PER_TOKEN", "1.0").strip()
+try:
+    PROMPT_PAD_USER_CHARS_PER_TOKEN = max(0.5, min(4.0, float(_PUCT)))
+except ValueError:
+    PROMPT_PAD_USER_CHARS_PER_TOKEN = 1.0
+# system + chat template + special：預留 token 數（可依實際 system 長度用環境變數調）
+_TPLRSV = os.environ.get("VLLM_CHAT_TEMPLATE_RESERVE_TOKENS", "2200").strip()
+CHAT_TEMPLATE_RESERVE_TOKENS = max(256, int(_TPLRSV)) if _TPLRSV.isdigit() else 2200
+_TRIM_CAP = os.environ.get("VLLM_COMPLETION_CEILING_TRIM", "96").strip()
+COMPLETION_CEILING_TRIM = max(0, int(_TRIM_CAP)) if _TRIM_CAP.isdigit() else 96
+# 若伺服器 max_model_len（或 /props n_ctx）較小，仍沿用預設長文填段會使 prompt 近滿窗、
+# max_tokens 被壓成 1～數個 token。預設開啟：在取得上下文長度後縮短 VLLM_PROMPT_PAD_TARGET_TOKENS。
+# llama-server --kv-unified：n_ctx 為**所有槽位共用** KV 池（非每槽 32K）；填段須依 total_slots 再縮。
+_ASH = os.environ.get("VLLM_AUTO_SHRINK_PROMPT_PAD", "1").strip().lower()
+AUTO_SHRINK_PROMPT_PAD = _ASH not in ("0", "false", "no", "off")
+_KVU = os.environ.get("LLAMACPP_KV_UNIFIED", "1").strip().lower()
+LLAMACPP_KV_UNIFIED = _KVU not in ("0", "false", "no", "off")
+_MGH = os.environ.get("VLLM_MIN_GENERATION_HEADROOM_TOKENS", "512").strip()
+MIN_GENERATION_HEADROOM_TOKENS = max(32, int(_MGH)) if _MGH.isdigit() else 512
+_WARN_LOW_MT = os.environ.get("VLLM_WARN_LOW_MAX_TOKENS", "32").strip()
+WARN_LOW_MAX_TOKENS = max(1, int(_WARN_LOW_MT)) if _WARN_LOW_MT.isdigit() else 32
 _MT_ENV = os.environ.get("VLLM_MAX_TOKENS", "").strip()
 MAX_TOKENS_ENV = max(1, int(_MT_ENV)) if _MT_ENV.isdigit() else None
 MAX_TOKENS = AUTO_MAX_TOKENS_FALLBACK
 _MAX_TOKENS_SOURCE = "auto"
 _MAX_TOKENS_NOTE = ""
+# 自適應填段說明（main 內於取得 max_model_len 後填入）
+_PROMPT_PAD_ADJUST_NOTE = ""
 # 採樣：較高 temperature 在併發下增加輸出多樣性；可用 VLLM_TEMPERATURE / VLLM_TOP_P 覆寫
 def _read_float(name: str, default: str) -> float:
     raw = os.environ.get(name, default)
@@ -258,6 +314,10 @@ SAMPLING_PRESENCE_PENALTY = max(-2.0, min(2.0, _read_float("VLLM_PRESENCE_PENALT
 # 流式輸出：前端／客戶端可及早收到 delta、較易逾時取消；壓測預設開啟（VLLM_CHAT_STREAM=0 關閉）
 _STREAM_ENV = os.environ.get("VLLM_CHAT_STREAM", "1").strip().lower()
 USE_STREAMING = _STREAM_ENV not in ("0", "false", "no", "off")
+# llama.cpp llama-server：slot 回收 + 題庫輪替時若開 cache_prompt，易只重疊極短前綴而整段重 prefill。
+# 壓測預設在請求 body 帶 cache_prompt=false；vLLM 等通常忽略此欄位。前綴快取實驗：VLLM_CHAT_CACHE_PROMPT=1。
+_CCP_RAW = os.environ.get("VLLM_CHAT_CACHE_PROMPT", "").strip().lower()
+CHAT_CACHE_PROMPT_REQUEST = _CCP_RAW in ("1", "true", "yes", "on")
 
 
 def _read_stream_generation_timeout_sec(default: float = 120.0) -> float:
@@ -272,12 +332,16 @@ def _read_stream_generation_timeout_sec(default: float = 120.0) -> float:
 
 # 單則請求產出門檻：SSE 自開始讀取 body 起、或非流式讀完整 JSON，逾時即中止並記錄（秒；VLLM_STREAM_GENERATION_TIMEOUT）
 STREAM_GENERATION_TIMEOUT_SEC = _read_stream_generation_timeout_sec()
-# 僅用於寫日誌：當 /v1/models 無法取得 max_model_len 時，回退顯示此值（與 vLLM 啟動參數一致時較準）
-FALLBACK_MAX_MODEL_LEN = os.environ.get("VLLM_MAX_MODEL_LEN", "")
+# llama-server 的 /v1/models 常以 meta.n_ctx 表上下文（未必有頂層 max_model_len）；router 模式請用
+# GET /props?model=CHAT_MODEL 取得子程序之 default_generation_settings.n_ctx；若僅 GET /props 且無 model，
+# 伺服器會回 n_ctx=0 的 placeholder，勿採信。仍無有效值時用 VLLM_MAX_MODEL_LEN（數字字串）；未設定則預設 32768。
+# 若 API 回報極小的 max_model_len（低於 1024）但環境變數 VLLM_MAX_MODEL_LEN 或 LLAMACPP_CTX_SIZE 較大，會自動覆寫。
+_FALLBACK_LEN = os.environ.get("VLLM_MAX_MODEL_LEN", "").strip()
+FALLBACK_MAX_MODEL_LEN = _FALLBACK_LEN if _FALLBACK_LEN else "32768"
 # 請求 body 的 `model` 必須與服務端 served model id 一致。
 # 若在 CLI 省略 --model，將呼叫 GET /v1/models 自動選取（單一模型直接用；多模型互動選擇；無 TTY 時可用 VLLM_CHAT_MODEL）。
-# 以下初始值僅在套用 CLI 前占位；實際值於 main() 內解析後寫入。
-CHAT_MODEL = os.environ.get("VLLM_CHAT_MODEL", "") or "gemma-4-E2B-it-AWQ-4bit"
+# 以下初始值僅在套用 CLI 前占位；實際值於 main() 內解析後寫入（與 start_vllm_server_qwen3.6_35b_a3b.sh／start_llamacpp_server_qwen36_27b_gguf.sh 預設一致）。
+CHAT_MODEL = os.environ.get("VLLM_CHAT_MODEL", "") or "ggufbench/Qwen3.6-27B-4bpw-16GB-VRAM"
 # 對話 system：預設角色扮演（可環境變數 VLLM_SYSTEM_PROMPT 覆寫整段）
 _CHAT_SYS_ENV = os.environ.get("VLLM_SYSTEM_PROMPT", "").strip()
 CHAT_SYSTEM_PROMPT = _CHAT_SYS_ENV or (
@@ -288,8 +352,8 @@ CHAT_SYSTEM_PROMPT = _CHAT_SYS_ENV or (
 )
 
 # OpenAPI 路徑固定為 /v1/chat/completions；主機/埠由環境變數或 CLI --base-url 設定（見 parse_cli）。
-# 預設為 127.0.0.1:8000（常見 vLLM serve）；本 repo 的 start_vllm_server_qwen3.5.sh 預設埠為 8002，請按需指定。
-_LLM_BASE = os.environ.get("LLM_BASE_URL", "http://127.0.0.1:8002").rstrip("/")
+# 預設 127.0.0.1:8004（GGUF llama-server 27B 等）；Qwen3.5-9B vLLM TP2 為 **8002**（見 run_test_max_tps_qwen35_9b.sh）；其他請 `-p` 或 LLM_BASE_URL。
+_LLM_BASE = os.environ.get("LLM_BASE_URL", "http://127.0.0.1:8004").rstrip("/")
 URL = f"{_LLM_BASE}/v1/chat/completions"
 HEADERS = {"Content-Type": "application/json"}
 # 單一 HTTP 請求逾時（秒）；環境變數 LLM_HTTP_TIMEOUT 可覆寫，CLI --timeout 優先
@@ -332,35 +396,57 @@ def _reports_max_tps_md_path() -> str:
 def parse_cli(argv=None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description=(
-            "本機 OpenAI 相容 Chat Completions API（vLLM、litellm 代理等）以固定併發量測 token 產能（系統級 TPS）。"
-            "預設 16 併發，可用 -c／VLLM_CONCURRENT 調整；預設附角色扮演型 system（VLLM_SYSTEM_PROMPT 可覆寫）。"
+            "本機 OpenAI 相容 Chat Completions API（vLLM、llama.cpp llama-server、litellm 等）以固定併發量測 token 產能（系統級 TPS）。"
+            "取得 /v1/models 與（llama-server）/props 之 max_model_len／n_ctx 後，預設會依上下文長度**自動縮短**"
+            "長文填段（可 `VLLM_AUTO_SHRINK_PROMPT_PAD=0` 或 `--no-adaptive-pad` 關閉），避免 max_tokens 被壓到 1。"
+            "可用 -c／VLLM_CONCURRENT、--prompt-pad-tokens 調整；預設附角色扮演型 system（VLLM_SYSTEM_PROMPT 可覆寫）。"
+            "請求預設帶 **cache_prompt=false**（llama.cpp 題庫輪替時減少整段重 prefill；VLLM_CHAT_CACHE_PROMPT=1 可開）。"
             "預設 stream=True（SSE）並設 presence_penalty=0.2，便於客戶端逾時取消並降低重複循環；"
             "環境變數 VLLM_CHAT_STREAM=0 或 --no-stream 可改回非流式。"
             "單則產出在預設 **120 s**（`VLLM_STREAM_GENERATION_TIMEOUT`）內須完成，否則中止該請求並記錄。"
-            "在 TTY 且已安裝 **rich**、且為 SSE 模式時，會以 **Rich Live** 顯示各路請求即時 delta；"
-            "可用 `VLLM_RICH_LIVE=0` 或 `--no-rich-live` 關閉。"
+            "在 TTY、已安裝 **rich**、且為 SSE 模式時，可加 `--rich-live` 或設 `VLLM_RICH_LIVE=1` 顯示各路請求即時 delta（預設關閉）。"
+            "**壓力測試：** `-R N` 連續 N 波同併發；`--stress-seconds SEC` 在 SEC 秒內維持併發不斷送新請求。"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "範例:\n"
-            "  python p620-scripts/test_max_tps.py -u http://127.0.0.1:8002\n"
+            "  python p620-scripts/test_max_tps.py\n"
+            "  # Qwen3.5-9B vLLM TP=2（./start_vllm_server_qwen3.5-9B_tp2.sh 預設埠 8002）：\n"
+            "  ./p620-scripts/run_test_max_tps_qwen35_9b.sh\n"
+            "  python p620-scripts/test_max_tps.py -p 8002\n"
+            "  # llama.cpp（與 start_llamacpp_server_qwen36_27b_gguf.sh 最簡設定 4 slot／32K ctx 對齊）：\n"
+            "  ./start_llamacpp_server_qwen36_27b_gguf.sh   # 另開終端\n"
+            "  python p620-scripts/test_max_tps.py -u http://127.0.0.1:8004 -c 4\n"
+            "  # Qwen3.6-35B-A3B GGUF（start_llamacpp_server_qwen36_35b_a3b_gguf.sh，預設 8005）：\n"
+            "  ./start_llamacpp_server_qwen36_35b_a3b_gguf.sh\n"
+            "  ./p620-scripts/run_stress_qwen36_35b_a3b_gguf.sh --stress-seconds 120\n"
+            "  ./p620-scripts/run_stress_qwen36_35b_a3b_gguf.sh --stress-seconds 180   # 預設上下文上界輸出、逾時 900s\n"
+            "  ./p620-scripts/run_stress_qwen36_35b_a3b_gguf.sh --preset soak        # 經 stress_qwen36_gguf.py 預設 600s\n"
+            "  # 前綴快取實驗（llama-server）：\n"
+            "  VLLM_CHAT_CACHE_PROMPT=1 python p620-scripts/test_max_tps.py -u http://127.0.0.1:8004\n"
             "  python p620-scripts/test_max_tps.py -p 8001\n"
-            "  python p620-scripts/test_max_tps.py -u http://127.0.0.1:8800 -m gemma-4-E2B-it-AWQ-4bit\n"
-            "  # 要提高併發（例如對照實驗）：\n"
-            "  python p620-scripts/test_max_tps.py -u http://127.0.0.1:8002 -c 64\n"
+            "  python p620-scripts/test_max_tps.py -u http://127.0.0.1:8800 -m ggufbench/Qwen3.6-27B-4bpw-16GB-VRAM\n"
+            "  # 提高併發對照實驗（建議把 max_tokens 壓低，避免 KV 爆量）：\n"
+            "  python p620-scripts/test_max_tps.py -u http://127.0.0.1:8004 -c 8 --max-tokens 512\n"
             "  # 無終端互動時（例如 CI）若伺服器有多個模型：\n"
-            "  VLLM_CHAT_MODEL=my-model-id python p620-scripts/test_max_tps.py -u http://127.0.0.1:8002\n"
+            "  VLLM_CHAT_MODEL=my-model-id python p620-scripts/test_max_tps.py -u http://127.0.0.1:8004\n"
             "  # 調整串流「產出完成」門檻（秒，預設 120）：\n"
-            "  VLLM_STREAM_GENERATION_TIMEOUT=300 python p620-scripts/test_max_tps.py -u http://127.0.0.1:8002\n"
-            "  # 關閉即時 Rich 面板（仍寫報告）：\n"
-            "  python p620-scripts/test_max_tps.py -u http://127.0.0.1:8002 --no-rich-live\n"
+            "  VLLM_STREAM_GENERATION_TIMEOUT=300 python p620-scripts/test_max_tps.py -u http://127.0.0.1:8004\n"
+            "  # 開啟即時 Rich 面板：\n"
+            "  python p620-scripts/test_max_tps.py -u http://127.0.0.1:8004 --rich-live\n"
+            "  # 壓力：連續 5 波、每波 8 併發（每波重新抽題）\n"
+            "  python p620-scripts/test_max_tps.py -u http://127.0.0.1:8003 -c 8 -R 5\n"
+            "  # 若要更穩定（降低共享 KV 壓力）：\n"
+            "  python p620-scripts/test_max_tps.py -u http://127.0.0.1:8004 -c 4 --prompt-pad-tokens 8192 --max-tokens 256\n"
+            "  # 壓力：180 秒內維持 8 路併發不斷送新請求（最簡設定建議保守）\n"
+            "  python p620-scripts/test_max_tps.py -u http://127.0.0.1:8004 -c 8 --stress-seconds 180 --max-tokens 512\n"
         ),
     )
     p.add_argument(
         "--base-url",
         "-u",
         default=_LLM_BASE,
-        help="API 根 URL（不含路徑），例如 http://127.0.0.1:8002；等同環境變數 LLM_BASE_URL",
+        help="API 根 URL（不含路徑），例如 http://127.0.0.1:8004 或 Qwen3.5-9B vLLM 之 8002；等同環境變數 LLM_BASE_URL",
     )
     p.add_argument(
         "--port",
@@ -391,6 +477,16 @@ def parse_cli(argv=None) -> argparse.Namespace:
         help=f"併發請求數（預設來自 VLLM_CONCURRENT，目前為 {CONCURRENT_REQUESTS}）",
     )
     p.add_argument(
+        "--prompt-pad-tokens",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "將每則 user 內容伸長至約 N tokens（中文填段預設 1 字元≈1 token，見 VLLM_PROMPT_PAD_USER_CHARS_PER_TOKEN）；0 關閉填段。"
+            f"省略時沿用環境變數 VLLM_PROMPT_PAD_TARGET_TOKENS（未設定時模組預設 {PROMPT_PAD_TARGET_TOKENS}）。"
+        ),
+    )
+    p.add_argument(
         "--max-tokens",
         type=int,
         default=None,
@@ -398,8 +494,10 @@ def parse_cli(argv=None) -> argparse.Namespace:
         help=(
             "每則請求的 max_tokens 上界。"
             "省略時：自動依 GET /v1/models（及 VLLM_MAX_MODEL_LEN 後援）決定模型基準並 ×110%%（ceil）；"
-            "再以 max_model_len 減輸入預留（VLLM_INPUT_TOKEN_RESERVE，預設 4096）收斂，"
-            "以符合 prompt_tokens＋max_tokens≤context；無法取得模型設定時 base 為 16384。"
+            "再以 max_model_len 減輸入預留（VLLM_INPUT_TOKEN_RESERVE 與長文填段估計）收斂，"
+            "最後可套用 VLLM_AUTO_MAX_TOKENS_CAP（預設 512；設 0／off／none 表示不額外掐長度）；"
+            "設 VLLM_COMPLETION_USE_CONTEXT_CEILING=1 時自動改採上下文可分配上界為 max_tokens；"
+            "無法取得模型設定時 base 為 16384。"
             "指定本參數或設定 VLLM_MAX_TOKENS 則強制使用該整數。"
         ),
     )
@@ -417,9 +515,22 @@ def parse_cli(argv=None) -> argparse.Namespace:
         help="停用 SSE 流式（預設開啟 stream=True；關閉後無法邊收邊取消）",
     )
     p.add_argument(
+        "--rich-live",
+        action="store_true",
+        help="啟用 Rich 即時 SSE 面板（預設關閉；須 TTY、stream=SSE、已安裝 rich）",
+    )
+    p.add_argument(
         "--no-rich-live",
         action="store_true",
-        help="關閉 Rich 即時 SSE 面板；預設在 TTY 且 stream=SSE 且有安裝 rich 時開啟",
+        help="明確關閉 Rich 面板（優先於 --rich-live 與 VLLM_RICH_LIVE）",
+    )
+    p.add_argument(
+        "--no-adaptive-pad",
+        action="store_true",
+        help=(
+            "停用「依伺服器 max_model_len 自動縮短長文填段」。"
+            "預設開啟（等同 VLLM_AUTO_SHRINK_PROMPT_PAD=1），避免 llama.cpp 僅 8K 上下文時 max_tokens 被壓成 1。"
+        ),
     )
     p.add_argument(
         "--timeout",
@@ -432,6 +543,28 @@ def parse_cli(argv=None) -> argparse.Namespace:
         action="store_true",
         help="略過啟動前連線檢查（不建議）",
     )
+    p.add_argument(
+        "--rounds",
+        "-R",
+        type=int,
+        default=1,
+        metavar="N",
+        help=(
+            "壓力測試：連續執行 **N** 次完整併發波（每波重新自題庫抽題，仍須 併發≤64）。"
+            "預設 1（與舊版單波相同）。若同時設定 --stress-seconds>0，以持續壓力為準，忽略本項。"
+        ),
+    )
+    p.add_argument(
+        "--stress-seconds",
+        type=float,
+        default=0.0,
+        metavar="SEC",
+        help=(
+            "持續壓力：在 **SEC** 秒內維持 -c 路併發，任務完成即再發新請求（題庫可重複抽取，不受 64 題上限）。"
+            ">0 時覆寫 --rounds。"
+            "即時 Rich 面板在此模式下自動關閉。"
+        ),
+    )
     return p.parse_args(argv)
 
 
@@ -441,7 +574,12 @@ def apply_cli_to_globals(args: argparse.Namespace) -> None:
     global SAMPLING_TEMPERATURE, SAMPLING_TOP_P, SAMPLING_PRESENCE_PENALTY, USE_STREAMING
     global _HTTP_TIMEOUT
     global _MAX_TOKENS_SOURCE, _MAX_TOKENS_NOTE
-    global _NO_RICH_LIVE_CLI_OFF
+    global _NO_RICH_LIVE_CLI_OFF, _RICH_LIVE_CLI_ON
+    global STRESS_ROUNDS, STRESS_SUSTAIN_SEC
+    global PROMPT_PAD_TARGET_TOKENS
+    global AUTO_SHRINK_PROMPT_PAD
+    if getattr(args, "no_adaptive_pad", False):
+        AUTO_SHRINK_PROMPT_PAD = False
     if args.port is not None:
         try:
             _LLM_BASE = _apply_port_to_base_url(str(args.base_url), args.port)
@@ -454,6 +592,8 @@ def apply_cli_to_globals(args: argparse.Namespace) -> None:
     if args.model is not None:
         CHAT_MODEL = args.model
     CONCURRENT_REQUESTS = max(1, int(args.concurrent))
+    if getattr(args, "prompt_pad_tokens", None) is not None:
+        PROMPT_PAD_TARGET_TOKENS = max(0, int(args.prompt_pad_tokens))
     _MAX_TOKENS_NOTE = ""
     if args.max_tokens is not None:
         MAX_TOKENS = max(1, int(args.max_tokens))
@@ -469,9 +609,21 @@ def apply_cli_to_globals(args: argparse.Namespace) -> None:
     SAMPLING_TEMPERATURE = float(args.temperature)
     SAMPLING_TOP_P = float(args.top_p)
     SAMPLING_PRESENCE_PENALTY = max(-2.0, min(2.0, float(args.presence_penalty)))
-    USE_STREAMING = not bool(args.no_stream)
+    # --no-stream 優先；否則沿用啟動時 VLLM_CHAT_STREAM（若僅用模組匯入則仍為 import 當下之 env）
+    if args.no_stream:
+        USE_STREAMING = False
+    else:
+        _se = os.environ.get("VLLM_CHAT_STREAM", "1").strip().lower()
+        USE_STREAMING = _se not in ("0", "false", "no", "off")
     _HTTP_TIMEOUT = max(1.0, float(args.timeout))
     _NO_RICH_LIVE_CLI_OFF = bool(args.no_rich_live)
+    _RICH_LIVE_CLI_ON = bool(args.rich_live) and not bool(args.no_rich_live)
+    STRESS_ROUNDS = max(1, int(getattr(args, "rounds", 1)))
+    raw_sustain = float(getattr(args, "stress_seconds", 0.0) or 0.0)
+    STRESS_SUSTAIN_SEC = max(0.0, raw_sustain)
+    if PREFIX_CACHE_TEST and STRESS_SUSTAIN_SEC <= 0 and STRESS_ROUNDS < 2:
+        STRESS_ROUNDS = 2
+        print("ℹ️  VLLM_PREFIX_CACHE_TEST=1：自動補為 2 波（第 2 波重用第一波 prompts 測 prefix cache 命中）。", flush=True)
 
 
 async def preflight_local_llm(session: aiohttp.ClientSession) -> None:
@@ -494,9 +646,18 @@ async def preflight_local_llm(session: aiohttp.ClientSession) -> None:
             f"   錯誤: {e}\n"
             "   請確認：\n"
             "   1) vLLM（或其他 OpenAI 相容服務）已在此機器啟動；\n"
-            "   2) 埠與啟動腳本一致（例如本 repo 的 Qwen 腳本預設 VLLM_API_PORT=8002）；\n"
+            "   2) 埠與啟動腳本一致（Qwen3.5-9B vLLM：`start_vllm_server_qwen3.5-9B_tp2.sh` 預設 **8002**；"
+            "Qwen3.6-35B-A3B NVFP4（對照 majentik TurboQuant 文檔族）："
+            "`start_vllm_server_qwen36_35b_a3b_turboquant_tp2.sh` 預設 **8002**（與 Qwen3.5-9B 同埠請改伺服端埠）；"
+            "其他 vLLM：`start_vllm_server_*.sh`；llama.cpp 27B：`start_llamacpp_server_qwen36_27b_gguf.sh` 預設 **8004**；"
+            "35B-A3B GGUF：`start_llamacpp_server_qwen36_35b_a3b_gguf.sh` 預設 **8005**；`-c` 請勿超過伺服端 `-np`／`LLAMACPP_PARALLEL`）；\n"
             "   3) 使用正確基底 URL，例如：\n"
+            "      ./p620-scripts/run_test_max_tps_qwen35_9b.sh\n"
+            "      ./p620-scripts/run_test_max_tps_qwen36_35b_a3b_turboquant.sh\n"
+            "      python p620-scripts/test_max_tps.py -p 8002\n"
             "      python p620-scripts/test_max_tps.py -u http://127.0.0.1:8002\n"
+            "      python p620-scripts/test_max_tps.py -u http://127.0.0.1:8004\n"
+            "      python p620-scripts/test_max_tps.py -u http://127.0.0.1:8005\n"
             "      （省略 -m 時會呼叫 GET /v1/models 自動選模型；多台時互動選或設 VLLM_CHAT_MODEL）\n"
             "   環境變數亦可設 LLM_BASE_URL、VLLM_CHAT_MODEL。"
         )
@@ -540,12 +701,79 @@ def build_models_info_for_id(entries: list, model_id: str) -> dict:
     out = {"max_model_len": None, "root": None}
     for m in entries:
         if isinstance(m, dict) and m.get("id") == model_id:
-            out["max_model_len"] = m.get("max_model_len")
+            out["max_model_len"] = _max_model_len_from_models_entry(m)
             out["root"] = m.get("root")
             break
     if out["max_model_len"] is None and FALLBACK_MAX_MODEL_LEN.isdigit():
         out["max_model_len"] = int(FALLBACK_MAX_MODEL_LEN)
     return out
+
+
+async def fetch_llamacpp_props(
+    session: aiohttp.ClientSession,
+    model_id: str | None = None,
+) -> dict:
+    """llama-server GET /props → n_ctx、total_slots 等。**router** 請帶 CHAT_MODEL 為 query「model」。"""
+    mid = (model_id or "").strip()
+    url = f"{_LLM_BASE}/props?model={quote(mid, safe='')}" if mid else f"{_LLM_BASE}/props"
+    out: dict = {"n_ctx": None, "total_slots": None}
+    try:
+        async with session.get(url, headers=HEADERS) as r:
+            if r.status != 200:
+                return out
+            payload = await r.json()
+    except Exception:
+        return out
+    if not isinstance(payload, dict):
+        return out
+    dgs = payload.get("default_generation_settings")
+    if isinstance(dgs, dict):
+        try:
+            n = int(dgs.get("n_ctx"))
+            if n > 0:
+                out["n_ctx"] = n
+        except (TypeError, ValueError):
+            pass
+    try:
+        slots = int(payload.get("total_slots"))
+        if slots > 0:
+            out["total_slots"] = slots
+    except (TypeError, ValueError):
+        pass
+    return out
+
+
+async def fetch_llamacpp_props_n_ctx(
+    session: aiohttp.ClientSession,
+    model_id: str | None = None,
+) -> int | None:
+    """llama-server GET /props → default_generation_settings.n_ctx。"""
+    return (await fetch_llamacpp_props(session, model_id)).get("n_ctx")
+
+
+def _llamacpp_budget_slots(server_slots: int | None) -> int:
+    """kv-unified 下用於均分 n_ctx 的槽數（優先 /props total_slots，否則客戶端併發）。"""
+    if server_slots and server_slots > 0:
+        return server_slots
+    return max(1, CONCURRENT_REQUESTS)
+
+
+def _effective_max_model_len_for_budget(
+    mlen: int,
+    server_slots: int | None = None,
+    *,
+    is_llamacpp: bool = False,
+) -> tuple[int, str]:
+    """
+    回傳 (有效上下文, 說明片段)。
+    僅 llama-server（GET /props 有 n_ctx）且 LLAMACPP_KV_UNIFIED=1 時，才按槽數均分 n_ctx；
+    vLLM 等每請求獨立上下文，勿誤用併發數當槽數（否則 32K 填段會被壓成 0）。
+    """
+    if not is_llamacpp or not LLAMACPP_KV_UNIFIED:
+        return mlen, "每請求獨立上下文" if not is_llamacpp else "llama 每槽獨立 n_ctx"
+    slots = _llamacpp_budget_slots(server_slots)
+    eff = max(512, mlen // slots)
+    return eff, f"kv-unified 共用池 ÷ **{slots}** 槽"
 
 
 def pick_model_from_server_entries(entries: list) -> str:
@@ -566,15 +794,15 @@ def pick_model_from_server_entries(entries: list) -> str:
 
     if len(ids) == 1:
         only = ids[0]
-        print(f"📌 伺服器僅提供一個模型，自動採用: {only}")
+        print(f"model: {only}")
         return only
 
     env_pick = (os.environ.get("VLLM_CHAT_MODEL") or "").strip()
     if env_pick and env_pick in id_set:
         if sys.stdin.isatty():
-            print(f"📌 環境變數 VLLM_CHAT_MODEL={env_pick!r} 命中伺服器列表，已自動採用（略過互動選單）。")
+            print(f"model: {env_pick} (VLLM_CHAT_MODEL)")
         else:
-            print(f"📌 非互動環境：使用 VLLM_CHAT_MODEL={env_pick!r}。")
+            print(f"model: {env_pick} (VLLM_CHAT_MODEL, non-interactive)")
         return env_pick
 
     if not sys.stdin.isatty():
@@ -590,8 +818,9 @@ def pick_model_from_server_entries(entries: list) -> str:
     for i, m in enumerate(sorted_models, 1):
         mid = m["id"]
         bits = []
-        if m.get("max_model_len") is not None:
-            bits.append(f"max_model_len={m['max_model_len']}")
+        nctx = _max_model_len_from_models_entry(m)
+        if nctx is not None:
+            bits.append(f"max_model_len／n_ctx={nctx}")
         if m.get("root"):
             bits.append(f"root={m['root']}")
         suffix = f"  ({', '.join(bits)})" if bits else ""
@@ -650,6 +879,46 @@ def _as_positive_int(val):
     return n if n > 0 else None
 
 
+def _max_model_len_from_models_entry(m: dict) -> int | None:
+    """vLLM 風格之 max_model_len，或 llama-server /v1/models 之 meta.n_ctx。"""
+    v = _as_positive_int(m.get("max_model_len"))
+    if v is not None:
+        return v
+    meta = m.get("meta")
+    if isinstance(meta, dict):
+        return _as_positive_int(meta.get("n_ctx"))
+    return None
+
+
+def _env_ctx_size_override() -> int | None:
+    """與啟動腳本對齊之環境後援（僅於偵測到可疑過小之上文時套用）。"""
+    for key in ("VLLM_MAX_MODEL_LEN", "LLAMACPP_CTX_SIZE"):
+        raw = os.environ.get(key, "").strip()
+        if raw.isdigit():
+            v = int(raw)
+            if v > 0:
+                return v
+    return None
+
+
+def _apply_llamacpp_context_repair(v1_info: dict) -> str:
+    """
+    部分閘道或缺欄位之 /v1/models 會回極小的 max_model_len；router 若未帶 model 查 /props 亦會失敗。
+    此時若環境變數提供較可信的 ctx，覆寫之。
+    """
+    ml = _as_positive_int(v1_info.get("max_model_len"))
+    if ml is None or ml >= 1024:
+        return ""
+    env_ml = _env_ctx_size_override()
+    if env_ml is None or env_ml <= ml:
+        return ""
+    v1_info["max_model_len"] = env_ml
+    return (
+        f"已以 **{env_ml:,}** 覆寫可疑的 max_model_len=**{ml:,}**"
+        "（來自 **VLLM_MAX_MODEL_LEN** 或 **LLAMACPP_CTX_SIZE**）"
+    )
+
+
 def _model_entry_for_id(entries: list, model_id: str) -> dict | None:
     for m in _unique_models_from_payload(entries):
         if isinstance(m, dict) and m.get("id") == model_id:
@@ -657,21 +926,120 @@ def _model_entry_for_id(entries: list, model_id: str) -> dict | None:
     return None
 
 
-def _completion_ceiling_given_max_model_len(mlen_maybe) -> tuple[int | None, int]:
+def _context_budget_input_reserve() -> int:
+    """估算「輸入側」至少佔用之 tokens，供 max_tokens 上界與上下文對齊。"""
+    if PROMPT_PAD_TARGET_TOKENS > 0:
+        return max(
+            INPUT_TOKEN_RESERVE_FOR_CONTEXT,
+            PROMPT_PAD_TARGET_TOKENS
+            + CHAT_TEMPLATE_RESERVE_TOKENS
+            + CONTEXT_BUDGET_SLACK_TOKENS,
+        )
+    return INPUT_TOKEN_RESERVE_FOR_CONTEXT
+
+
+def _completion_ceiling_given_max_model_len(
+    mlen_maybe,
+    server_slots: int | None = None,
+    *,
+    is_llamacpp: bool = False,
+) -> tuple[int | None, int]:
     """(單請求允許的最大 max_tokens, 實際採用的輸入預留)。未知 max_model_len 時回 (None, 0)。"""
     ml = _as_positive_int(mlen_maybe)
     if ml is None:
         return None, 0
-    reserve = min(INPUT_TOKEN_RESERVE_FOR_CONTEXT, max(0, ml - 1))
-    return max(1, ml - reserve), reserve
+    eff_ml, _ = _effective_max_model_len_for_budget(ml, server_slots, is_llamacpp=is_llamacpp)
+    reserve = _context_budget_input_reserve()
+    reserve = min(reserve, max(0, eff_ml - 1))
+    raw_cap = eff_ml - reserve
+    cap = max(1, raw_cap - COMPLETION_CEILING_TRIM)
+    return cap, reserve
 
 
-def finalize_max_tokens_budget(desired: int, v1_info: dict) -> tuple[int, str]:
+def _auto_shrink_prompt_pad_for_max_model_len(
+    mlen_maybe,
+    server_slots: int | None = None,
+    *,
+    is_llamacpp: bool = False,
+) -> str:
+    """
+    在已知 max_model_len（含 GET /props 的 n_ctx）時，避免長文填段 + template／slack 預留塞滿上下文，
+    導致 finalize_max_tokens_budget 將 max_tokens 壓到極小；kv-unified 時再按槽數均分 n_ctx。
+    會就地調整全域 PROMPT_PAD_TARGET_TOKENS。
+    """
+    global PROMPT_PAD_TARGET_TOKENS
+    ml = _as_positive_int(mlen_maybe)
+    if not AUTO_SHRINK_PROMPT_PAD or ml is None:
+        return ""
+    if PROMPT_PAD_TARGET_TOKENS <= 0:
+        return ""
+    eff_ml, eff_note = _effective_max_model_len_for_budget(
+        ml, server_slots, is_llamacpp=is_llamacpp
+    )
+    tpl_rsv = min(
+        CHAT_TEMPLATE_RESERVE_TOKENS,
+        max(384, eff_ml // 2),
+    )
+    overhead = tpl_rsv + CONTEXT_BUDGET_SLACK_TOKENS + COMPLETION_CEILING_TRIM
+    cap = eff_ml - MIN_GENERATION_HEADROOM_TOKENS - overhead
+    if cap < 0:
+        cap = 0
+    old = PROMPT_PAD_TARGET_TOKENS
+    if old <= cap:
+        return ""
+    PROMPT_PAD_TARGET_TOKENS = min(old, cap)
+    extra = ""
+    if cap < 512 and is_llamacpp and LLAMACPP_KV_UNIFIED:
+        extra = (
+            "；**建議**提高 `LLAMACPP_CTX_SIZE`（壓測預設 131072）或降低 "
+            "`LLAMACPP_PARALLEL`／`VLLM_CONCURRENT`"
+        )
+    return (
+        f"自適應填段：`VLLM_PROMPT_PAD_TARGET_TOKENS` **{old:,}** → **{PROMPT_PAD_TARGET_TOKENS:,}** "
+        f"（n_ctx=**{ml:,}**，{eff_note}→每槽≈**{eff_ml:,}**；"
+        f"預留 **{MIN_GENERATION_HEADROOM_TOKENS:,}** tok 予生成；overhead≈**{overhead:,}**{extra}）"
+    )
+
+
+def _pad_user_prompt_to_target_tokens(base: str, target_user_tokens: int) -> str:
+    """在題幹後附加填段。中文為主時總字元數宜≈目標 token 數（VLLM_PROMPT_PAD_USER_CHARS_PER_TOKEN，預設 1.0）。"""
+    if target_user_tokens <= 0:
+        return base
+    sep = "\n\n---\n"
+    goal_user_chars = int(max(0, target_user_tokens) * PROMPT_PAD_USER_CHARS_PER_TOKEN)
+    need_chars = goal_user_chars - len(base) - len(sep)
+    if need_chars <= 0:
+        return base
+    unit = (
+        "【長文填段】壓測用可重複段落；中英混合 tokenizer 佔位；"
+        "式樣：Σx、SQL、HTTP/2、IPv6、prefill/decode、KV cache、chunked prefill。\n"
+    )
+    ulen = len(unit)
+    reps, rem = divmod(need_chars, ulen)
+    pad = unit * reps + unit[:rem]
+    return f"{base}{sep}{pad}"
+
+
+def _final_user_content(prompt: str) -> str:
+    return _pad_user_prompt_to_target_tokens(prompt, PROMPT_PAD_TARGET_TOKENS)
+
+
+def finalize_max_tokens_budget(
+    desired: int,
+    v1_info: dict,
+    *,
+    is_llamacpp: bool = False,
+    server_slots: int | None = None,
+) -> tuple[int, str]:
     """
     確保請求 max_tokens 不超過 max_model_len − 輸入預留。
     desired 來自自動公式、CLI 或環境變數均可。
     """
-    cap_ctx, reserve = _completion_ceiling_given_max_model_len(v1_info.get("max_model_len"))
+    cap_ctx, reserve = _completion_ceiling_given_max_model_len(
+        v1_info.get("max_model_len"),
+        server_slots,
+        is_llamacpp=is_llamacpp,
+    )
     if cap_ctx is None or desired <= cap_ctx:
         return max(1, int(desired)), ""
     ml = _as_positive_int(v1_info.get("max_model_len"))
@@ -682,11 +1050,38 @@ def finalize_max_tokens_budget(desired: int, v1_info: dict) -> tuple[int, str]:
     )
 
 
-def resolve_auto_max_tokens(entries: list, model_id: str, v1_info: dict) -> tuple[int, str]:
+def resolve_auto_max_tokens(
+    entries: list,
+    model_id: str,
+    v1_info: dict,
+    *,
+    is_llamacpp: bool = False,
+    server_slots: int | None = None,
+) -> tuple[int, str]:
     """
     每則 max_tokens：自模型資訊取基準欄位，ceil(基準 × 110%)；再由 finalize_max_tokens_budget 依上下文收斂。
     無任何可用基準時採 AUTO_MAX_TOKENS_FALLBACK，且不乘以 1.1。
     """
+    if COMPLETION_USE_CONTEXT_CEILING:
+        cap_ctx, reserve = _completion_ceiling_given_max_model_len(
+            v1_info.get("max_model_len"),
+            server_slots,
+            is_llamacpp=is_llamacpp,
+        )
+        if cap_ctx is not None:
+            capped = max(1, int(cap_ctx))
+            note = (
+                f"已啟用 **VLLM_COMPLETION_USE_CONTEXT_CEILING**：max_tokens = **{capped:,}**"
+                f"（依 max_model_len 與填段／template 估計之可分配上界；輸入側預估預留 **{reserve:,}**）"
+            )
+            if AUTO_MAX_TOKENS_CAP is not None and capped > AUTO_MAX_TOKENS_CAP:
+                note += (
+                    f"；已套用 VLLM_AUTO_MAX_TOKENS_CAP={AUTO_MAX_TOKENS_CAP:,}："
+                    f"{capped:,} → **{AUTO_MAX_TOKENS_CAP:,}**"
+                )
+                capped = AUTO_MAX_TOKENS_CAP
+            return capped, note
+
     entry = _model_entry_for_id(entries, model_id)
     mlen = _as_positive_int(v1_info.get("max_model_len"))
 
@@ -700,9 +1095,9 @@ def resolve_auto_max_tokens(entries: list, model_id: str, v1_info: dict) -> tupl
                 base, src = v, key
                 break
         if base is None:
-            v = _as_positive_int(entry.get("max_model_len"))
+            v = _max_model_len_from_models_entry(entry)
             if v is not None:
-                base, src = v, "max_model_len(entry)"
+                base, src = v, "max_model_len／meta.n_ctx(entry)"
 
     if base is None and mlen is not None:
         base, src = mlen, "max_model_len(server)"
@@ -712,13 +1107,40 @@ def resolve_auto_max_tokens(entries: list, model_id: str, v1_info: dict) -> tupl
             "未取得可用模型上下文／輸出欄位（亦無有效 max_model_len 後援），"
             f"採固定測試基準 {AUTO_MAX_TOKENS_FALLBACK:,}（不套用 ×{MODEL_MAX_OUTPUT_CEILING_RATIO:.0%}）"
         )
-        capped, suf = finalize_max_tokens_budget(AUTO_MAX_TOKENS_FALLBACK, v1_info)
-        return capped, note0 + suf
+        capped, suf = finalize_max_tokens_budget(
+            AUTO_MAX_TOKENS_FALLBACK,
+            v1_info,
+            is_llamacpp=is_llamacpp,
+            server_slots=server_slots,
+        )
+        if AUTO_MAX_TOKENS_CAP is not None and capped > AUTO_MAX_TOKENS_CAP:
+            capped2 = min(capped, AUTO_MAX_TOKENS_CAP)
+            cap_note = (
+                f"；已套用 VLLM_AUTO_MAX_TOKENS_CAP={AUTO_MAX_TOKENS_CAP:,}："
+                f"{capped:,} → **{capped2:,}**"
+            )
+        else:
+            capped2 = capped
+            cap_note = ""
+        return capped2, note0 + suf + cap_note
 
     capped = max(1, int(math.ceil(base * MODEL_MAX_OUTPUT_CEILING_RATIO)))
     note = f"`{src}`={base:,} × {MODEL_MAX_OUTPUT_CEILING_RATIO:.0%}（ceil）→ **{capped:,}**"
-    capped, ctx_note = finalize_max_tokens_budget(capped, v1_info)
+    capped, ctx_note = finalize_max_tokens_budget(
+        capped,
+        v1_info,
+        is_llamacpp=is_llamacpp,
+        server_slots=server_slots,
+    )
     note += ctx_note
+    if AUTO_MAX_TOKENS_CAP is not None:
+        capped2 = min(capped, AUTO_MAX_TOKENS_CAP)
+        if capped2 < capped:
+            note += (
+                f"；已套用 VLLM_AUTO_MAX_TOKENS_CAP={AUTO_MAX_TOKENS_CAP:,}："
+                f"{capped:,} → **{capped2:,}**"
+            )
+            capped = capped2
     return capped, note
 
 
@@ -735,8 +1157,9 @@ def _freeze_prompt_bank() -> tuple[str, ...]:
     if len(lines) != 64:
         raise RuntimeError(f"題庫須為 64 題幹（目前 {len(lines)}）：{path}")
     suff = (
-        " 【作答強制】須含：⑴明列範疇／假設／非目標；⑵三段以上分段小標推進；⑶至少一例反例／邊界／不確定性；"
-        "⑷數字結論或核對清單。程式／SQL／數學須附上可檢視之具體片段並註複雜度。"
+        " 【長文作答強制】全文須達 3000 字以上；須含：⑴明列範疇／假設／非目標；⑵五段以上分段小標推進；"
+        "⑶至少兩例反例／邊界／不確定性；⑷數字結論或核對清單；⑸綜述與後續研究／實務建議。"
+        "程式／SQL／數學須附上可檢視之具體片段並註複雜度。"
     )
     return tuple(s + suff for s in lines)
 
@@ -775,19 +1198,15 @@ def prepare_prompts_for_run() -> str:
     rows = "| 項目 | 內容 |\n|:--|:--|\n"
     rows += f"| 題庫規模（檔：`test_max_tps_topics_64.txt`） | **{nb}** 題高複合模版 |\n"
     rows += f"| 本輪抽題 | **{n}**（`random.sample`、不重複） |\n"
+    pad_note = (
+        f"**{PROMPT_PAD_TARGET_TOKENS}**（粗估 tokens；0＝關閉）"
+        if PROMPT_PAD_TARGET_TOKENS
+        else "**0**（關閉，僅題庫題幹）"
+    )
+    rows += f"| user 長文填段 | {pad_note} |\n"
     rows += f"| 隨機種子 | {seed_note} |\n"
     return rows
 
-
-
-def _format_ctx_line(info: dict) -> str:
-    mlen = info.get("max_model_len")
-    mlen_s = str(mlen) if mlen is not None else "未知（可查 vLLM --max-model-len 或設 VLLM_MAX_MODEL_LEN）"
-    root = info.get("root")
-    base = f"max_model_len={mlen_s}"
-    if root:
-        return f"{base}  |  root={root}"
-    return base
 
 
 def _format_summary_markdown(
@@ -805,6 +1224,7 @@ def _format_summary_markdown(
     n_generation_timeout: int,
     v1_info: dict,
     n_ok: int,
+    total_requests: int,
     total_time: float,
     total_prompt: int,
     total_completion: int,
@@ -813,12 +1233,16 @@ def _format_summary_markdown(
     avg_in: float,
     avg_out: float,
     prompt_sampling_md: str = "",
+    stress_profile: str = "",
+    prompt_pad_target_tokens: int = 0,
+    cache_prompt_request: bool = False,
+    prompt_pad_adjust_note: str = "",
 ) -> str:
     mlen = v1_info.get("max_model_len")
     mlen_disp = str(mlen) if mlen is not None else "未知"
     root = v1_info.get("root") or "—"
-    ok_line = f"{n_ok} / {concurrent_requests}"
-    pct_ok = (100.0 * n_ok / concurrent_requests) if concurrent_requests else 0.0
+    ok_line = f"{n_ok} / {total_requests}"
+    pct_ok = (100.0 * n_ok / total_requests) if total_requests else 0.0
     avg_blurb = ""
     if n_ok:
         avg_blurb = f"平均每則：prompt ≈ **{avg_in:,.1f}** ｜ completion ≈ **{avg_out:,.1f}** tokens。"
@@ -829,10 +1253,18 @@ def _format_summary_markdown(
 
     stream_label = "是（SSE）" if use_streaming else "否"
 
+    stress_block = ""
+    if stress_profile.strip():
+        stress_block = f"\n> **壓力模式：** {stress_profile.strip()}\n"
+
+    pad_adj_block = ""
+    if prompt_pad_adjust_note.strip():
+        pad_adj_block = f"\n> **填段調整：** {prompt_pad_adjust_note.strip()}\n"
+
     return f"""## 執行摘要
 
-> **本輪重點：** **{concurrent_requests}** 路併發、**總耗時** **{total_time:,.2f} s**，以 **completion_tokens** 計之系統吞吐量 **{system_tps:,.2f} tok/s**；成功請求 **{ok_line}**（{pct_ok:.0f}%）。
-
+> **本輪重點：** **{concurrent_requests}** 路併發、總請求數 **{total_requests}**、**總耗時** **{total_time:,.2f} s**，以 **completion_tokens** 計之系統吞吐量 **{system_tps:,.2f} tok/s**；成功請求 **{ok_line}**（{pct_ok:.0f}%）。
+{stress_block}{pad_adj_block}
 ---
 
 ### 核心指標
@@ -865,23 +1297,26 @@ def _format_summary_markdown(
 
 | 項目 | 值 |
 |:--|:--|
+| user 填段目標（估 tokens；`VLLM_PROMPT_PAD_USER_CHARS_PER_TOKEN`） | **{prompt_pad_target_tokens if prompt_pad_target_tokens else "0（關閉）"}** |
 | 每則 max_tokens（請求上界） | **{max_tokens:,}** |
 | max_tokens 決策說明 | {max_tokens_note or "—"} |
 | temperature | {temperature:g} |
 | top_p | {top_p:g} |
 | presence_penalty | {presence_penalty:g}（建議 0.1～0.5 降低重複循環）|
 | stream | **{stream_label}**（逾時會中止該請求並寫入報告）|
+| cache_prompt（請求 body） | **{"true" if cache_prompt_request else "false"}**（`VLLM_CHAT_CACHE_PROMPT=1` → true；llama.cpp 題庫輪替建議 false）|
 | 單請求產出門檻 | **{generation_timeout_sec:g}** s（`VLLM_STREAM_GENERATION_TIMEOUT`）|
-| 逾時中止 | **{n_generation_timeout}**／{concurrent_requests} |
+| 逾時中止 | **{n_generation_timeout}**／{total_requests} |
 
 """
 
 
-def _print_run_summary_terminal(
+def _print_run_summary_terminal_compact(
     *,
     llm_base: str,
     chat_model: str,
     concurrent_requests: int,
+    total_requests: int,
     max_tokens: int,
     max_tokens_note: str,
     temperature: float,
@@ -900,64 +1335,59 @@ def _print_run_summary_terminal(
     avg_in: float,
     avg_out: float,
     prompt_sampling_note: str = "",
+    stress_label: str = "",
 ) -> None:
-    """終端機用：框線 + ANSI 強調主要指標。"""
+    """終端機：精簡單行摘要（詳情見 Markdown 報告）。"""
     mlen = v1_info.get("max_model_len")
-    mlen_s = str(mlen) if mlen is not None else "未知"
-    root = v1_info.get("root") or "—"
-    R, G, C, B, DIM, RST = (
-        "\033[91m",
-        "\033[92m",
-        "\033[96m",
-        "\033[1m",
-        "\033[2m",
-        "\033[0m",
+    mlen_s = str(mlen) if mlen is not None else "?"
+    stream_s = "SSE" if use_streaming else "off"
+    ok_frac = f"{n_ok}/{total_requests}"
+    tmo_s = (
+        f" stream_timeout={n_generation_timeout}/{total_requests}"
+        if n_generation_timeout
+        else ""
     )
-    bar = "═" * 58
-
-    def row(label: str, value: str) -> str:
-        return f"  {DIM}{label:<16}{RST} {value}"
-
-    _ml = 72
-
-    def clip(s: str) -> str:
-        return (s[: _ml - 1] + "…") if len(s) > _ml else s
-
-    print("")
-    print(f"{C}{bar}{RST}")
-    print(f"  {B}▸ 執行摘要｜Token 產能{RST}")
-    print(f"{C}{bar}{RST}")
-    print(row("TPS (completion)", f"{R}{B}{system_tps:,.2f}{RST} tok/s"))
-    print(row("總耗時", f"{total_time:,.2f} s"))
-    print(row("成功請求", f"{n_ok} / {concurrent_requests}"))
-    print(row("prompt Σ", f"{total_prompt:,}"))
-    print(row("completion Σ", f"{G}{total_completion:,}{RST}"))
-    print(row("total_tokens Σ", f"{total_all:,}"))
-    if n_ok:
-        print(row("每則平均", f"in≈{avg_in:,.1f}  out≈{avg_out:,.1f}"))
-    print(f"{C}{bar}{RST}")
-    print(row("API", llm_base))
-    print(row("model", clip(chat_model)))
-    print(row("max_model_len", mlen_s))
-    print(row("root", clip(root)))
-    print(row("max_tokens∕請求", f"{B}{max_tokens:,}{RST}"))
-    if max_tokens_note.strip():
-        plain = clip(max_tokens_note.replace("`", "").replace("**", ""))
-        print(row("max_tokens 說明", f"{plain}"))
-    if prompt_sampling_note.strip():
-        pn = clip(prompt_sampling_note.replace("`", "").replace("**", "").replace("|", " "))
-        print(row("題庫抽樣", pn))
-    print(row("temperature∕top_p", f"{temperature:g} / {top_p:g}"))
-    print(row("presence_penalty", f"{presence_penalty:g}"))
-    print(row("stream", "SSE 開" if use_streaming else "關"))
+    stress_s = f" [{stress_label}]" if stress_label.strip() else ""
     print(
-        row(
-            "產出門檻／逾時",
-            f"{generation_timeout_sec:g}s ｜ {n_generation_timeout}/{concurrent_requests} 則中止",
-        )
+        f"完成: TPS={system_tps:,.2f} tok/s  wall={total_time:,.2f}s  ok={ok_frac}  "
+        f"n_req={total_requests}  concurrent={concurrent_requests}  "
+        f"completion_Σ={total_completion:,}  prompt_Σ={total_prompt:,}  "
+        f"api={llm_base}  model={chat_model!r}  max_model_len={mlen_s}  "
+        f"max_tokens={max_tokens}  {stream_s}  gen_cap={generation_timeout_sec:g}s{tmo_s}{stress_s}"
     )
-    print(f"{C}{bar}{RST}")
-    print("")
+    if prompt_sampling_note.strip():
+        pn = prompt_sampling_note.replace("`", "").replace("**", "").replace("|", " ")
+        print(f"  抽樣: {pn}")
+
+
+def _merge_reasoning_and_content_for_report(reasoning: str, content: str) -> str:
+    """合併推理段與正文。llama-server 常用 delta.reasoning_content；vLLM 0.20+ 對 Qwen 思考流多用 delta.reasoning。"""
+    r = (reasoning or "").strip()
+    c = (content or "").strip()
+    if r and c:
+        return f"【reasoning】\n{r}\n\n【content】\n{c}"
+    if r:
+        return f"【reasoning】\n{r}"
+    return c
+
+
+def _coerce_delta_text(val: object) -> str:
+    """OpenAI／vLLM 串流 delta 的 content／reasoning 可能是 str，或多模態用的 list[dict]。"""
+    if val is None:
+        return ""
+    if isinstance(val, str):
+        return val
+    if isinstance(val, list):
+        chunks: list[str] = []
+        for item in val:
+            if isinstance(item, dict):
+                tx = item.get("text")
+                if tx is not None:
+                    chunks.append(str(tx))
+            elif isinstance(item, str):
+                chunks.append(item)
+        return "".join(chunks)
+    return str(val)
 
 
 async def _consume_sse_chat_completion(
@@ -971,8 +1401,14 @@ async def _consume_sse_chat_completion(
     Wall-clock `deadline_sec` 涵蓋等候下一資料列（含首包與資料列間空隙），逾時則 StreamGenerationTimeout。
     """
     content_parts: list[str] = []
+    reasoning_parts: list[str] = []
     usage: dict = {}
     t0 = time.monotonic()
+
+    def _partial_merged() -> str:
+        return _merge_reasoning_and_content_for_report(
+            "".join(reasoning_parts), "".join(content_parts)
+        )
 
     while True:
         elapsed = time.monotonic() - t0
@@ -980,7 +1416,7 @@ async def _consume_sse_chat_completion(
             raise StreamGenerationTimeout(
                 elapsed_sec=elapsed,
                 deadline_sec=deadline_sec,
-                partial_content="".join(content_parts),
+                partial_content=_partial_merged(),
                 usage=usage,
             )
         remain = max(1e-3, deadline_sec - elapsed)
@@ -991,7 +1427,7 @@ async def _consume_sse_chat_completion(
             raise StreamGenerationTimeout(
                 elapsed_sec=elapsed,
                 deadline_sec=deadline_sec,
-                partial_content="".join(content_parts),
+                partial_content=_partial_merged(),
                 usage=usage,
             ) from None
 
@@ -1018,28 +1454,44 @@ async def _consume_sse_chat_completion(
         if choices and isinstance(choices[0], dict):
             delta = choices[0].get("delta") or {}
             if isinstance(delta, dict):
-                piece = delta.get("content")
+                piece = _coerce_delta_text(delta.get("content"))
                 if piece:
                     content_parts.append(piece)
                     if dashboard is not None:
                         await dashboard.append_piece(request_id, piece)
+                # vLLM：reasoning；部分伺服器：reasoning_content
+                for rk in ("reasoning_content", "reasoning"):
+                    r_piece = _coerce_delta_text(delta.get(rk))
+                    if r_piece:
+                        reasoning_parts.append(r_piece)
+                        if dashboard is not None:
+                            await dashboard.append_piece(request_id, r_piece)
 
-    return "".join(content_parts), usage
+    return (
+        _merge_reasoning_and_content_for_report(
+            "".join(reasoning_parts), "".join(content_parts)
+        ),
+        usage,
+    )
 
 
-async def fetch(session, request_id: int, dashboard: "_ConcurrentStreamDashboard | None" = None):
-    prompt = _CURRENT_RUN_PROMPTS[request_id]
-
+async def fetch(
+    session,
+    request_id: int,
+    prompt: str,
+    dashboard: "_ConcurrentStreamDashboard | None" = None,
+):
     data = {
         "model": CHAT_MODEL,
         "messages": [
             {"role": "system", "content": CHAT_SYSTEM_PROMPT},
-            {"role": "user", "content": prompt},
+            {"role": "user", "content": _final_user_content(prompt)},
         ],
         "max_tokens": MAX_TOKENS,
         "temperature": SAMPLING_TEMPERATURE,
         "top_p": SAMPLING_TOP_P,
         "presence_penalty": SAMPLING_PRESENCE_PENALTY,
+        "cache_prompt": CHAT_CACHE_PROMPT_REQUEST,
     }
     if USE_STREAMING:
         data["stream"] = True
@@ -1052,7 +1504,6 @@ async def fetch(session, request_id: int, dashboard: "_ConcurrentStreamDashboard
         async with session.post(URL, headers=HEADERS, json=data) as response:
             if response.status != 200:
                 error_text = await response.text()
-                print(f"請求 {request_id} 失敗 (HTTP {response.status}): {error_text}")
                 if dashboard is not None:
                     await dashboard.mark_terminal(
                         request_id, f"失敗 HTTP {response.status}"
@@ -1066,6 +1517,8 @@ async def fetch(session, request_id: int, dashboard: "_ConcurrentStreamDashboard
                     "total_tokens": 0,
                     "time": 0,
                     "success": False,
+                    "http_status": response.status,
+                    "error": error_text[:2000],
                 }
 
             if USE_STREAMING:
@@ -1089,10 +1542,6 @@ async def fetch(session, request_id: int, dashboard: "_ConcurrentStreamDashboard
                         completion_tokens = max(1, int(len(pct) / 3.5))
                     if total_tokens == 0 and (prompt_tokens or completion_tokens):
                         total_tokens = prompt_tokens + completion_tokens
-                    print(
-                        f"請求 {request_id} SSE 逾時（門檻 {STREAM_GENERATION_TIMEOUT_SEC:g}s，"
-                        f"已讀 {e.elapsed_sec:.2f}s）：已終止連線並記錄部份輸出"
-                    )
                     if dashboard is not None:
                         await dashboard.set_response_preview(request_id, pct)
                         await dashboard.mark_terminal(request_id, "SSE 逾時（已錄片段）")
@@ -1130,10 +1579,6 @@ async def fetch(session, request_id: int, dashboard: "_ConcurrentStreamDashboard
                     )
                 except asyncio.TimeoutError:
                     end_time = time.time()
-                    print(
-                        f"請求 {request_id} 非流式讀取逾時（≥{STREAM_GENERATION_TIMEOUT_SEC:g}s）："
-                        "已中止並記錄"
-                    )
                     if dashboard is not None:
                         await dashboard.mark_terminal(request_id, "非 SSE 逾時")
                     return {
@@ -1149,14 +1594,21 @@ async def fetch(session, request_id: int, dashboard: "_ConcurrentStreamDashboard
                         "deadline_sec": STREAM_GENERATION_TIMEOUT_SEC,
                     }
                 end_time = time.time()
-                content = ""
+                content_raw = ""
+                reasoning_raw = ""
                 usage = result.get("usage") or {}
                 completion_tokens = int(usage.get("completion_tokens", 0) or 0)
                 prompt_tokens = int(usage.get("prompt_tokens", 0) or 0)
                 total_tokens = int(usage.get("total_tokens", 0) or 0)
 
                 if "choices" in result and len(result["choices"]) > 0:
-                    content = result["choices"][0].get("message", {}).get("content", "")
+                    msg = result["choices"][0].get("message") or {}
+                    if isinstance(msg, dict):
+                        content_raw = _coerce_delta_text(msg.get("content"))
+                        reasoning_raw = _coerce_delta_text(
+                            msg.get("reasoning_content") or msg.get("reasoning")
+                        )
+                content = _merge_reasoning_and_content_for_report(reasoning_raw, content_raw)
 
                 if dashboard is not None:
                     await dashboard.set_response_preview(request_id, content or "")
@@ -1173,7 +1625,6 @@ async def fetch(session, request_id: int, dashboard: "_ConcurrentStreamDashboard
                 "success": True,
             }
     except Exception as e:
-        print(f"請求 {request_id} 失敗: {e}")
         if dashboard is not None:
             await dashboard.mark_terminal(request_id, f"異常 · {type(e).__name__}")
         return {
@@ -1185,101 +1636,242 @@ async def fetch(session, request_id: int, dashboard: "_ConcurrentStreamDashboard
             "total_tokens": 0,
             "time": 0,
             "success": False,
+            "error": f"{type(e).__name__}: {e}",
         }
+
+async def run_concurrent_wave(
+    session: aiohttp.ClientSession,
+    sse_dash: "_ConcurrentStreamDashboard | None",
+    prompts: list[str],
+) -> list[dict]:
+    if len(prompts) != CONCURRENT_REQUESTS:
+        raise ValueError("prompt 列表長須等於 CONCURRENT_REQUESTS")
+    tasks = [
+        fetch(session, rid, prompts[rid], dashboard=sse_dash)
+        for rid in range(CONCURRENT_REQUESTS)
+    ]
+    return await asyncio.gather(*tasks)
+
+
+async def run_sustained_stress(session: aiohttp.ClientSession) -> list[dict]:
+    """維持 CONCURRENT_REQUESTS 個 worker：時間未止前結束後即再發新請求；題目可重複。"""
+    results: list[dict] = []
+    results_lock = asyncio.Lock()
+    deadline = time.monotonic() + STRESS_SUSTAIN_SEC
+    req_seq = itertools.count(0)
+    seed_raw = os.environ.get("VLLM_PROMPT_SEED", "").strip()
+    try:
+        master = random.Random(int(seed_raw)) if seed_raw != "" else random.Random()
+    except ValueError:
+        master = random.Random()
+
+    async def worker_loop() -> None:
+        local = random.Random(master.randint(0, 2**31 - 1))
+        while time.monotonic() < deadline:
+            rid = next(req_seq)
+            prompt = local.choice(_PROMPT_BANK)
+            r = await fetch(session, rid, prompt, dashboard=None)
+            async with results_lock:
+                results.append(r)
+
+    await asyncio.gather(*[worker_loop() for _ in range(CONCURRENT_REQUESTS)])
+    results.sort(key=lambda x: x["id"])
+    return results
+
 
 async def main(skip_preflight: bool = False, model_override=None) -> None:
     global MAX_TOKENS, _MAX_TOKENS_NOTE
-    start_time = time.time()
+    global _PROMPT_PAD_ADJUST_NOTE
+    glob_start = time.time()
+    stress_profile = ""
     req_timeout = aiohttp.ClientTimeout(total=_HTTP_TIMEOUT)
 
-    async with aiohttp.ClientSession(timeout=req_timeout) as session:
+    async with aiohttp.ClientSession(
+        timeout=req_timeout,
+        connector=aiohttp.TCPConnector(limit=max(64, CONCURRENT_REQUESTS + 8)),
+    ) as session:
         if not skip_preflight:
             await preflight_local_llm(session)
         entries = await resolve_chat_model(session, model_override)
         v1_info = build_models_info_for_id(entries, CHAT_MODEL)
+        llamacpp_props = await fetch_llamacpp_props(session, CHAT_MODEL)
+        props_n_ctx = llamacpp_props.get("n_ctx")
+        props_slots = llamacpp_props.get("total_slots")
+        if props_n_ctx is not None:
+            # llama-server：/props 之 n_ctx 對應 --ctx-size；--kv-unified 時為全槽共用 KV 池
+            v1_info["max_model_len"] = props_n_ctx
+        repair_note = _apply_llamacpp_context_repair(v1_info)
+        if repair_note.strip():
+            print(
+                "ℹ️  "
+                + repair_note.replace("`", "").replace("**", ""),
+                flush=True,
+            )
+        is_llamacpp = props_n_ctx is not None
+        _PROMPT_PAD_ADJUST_NOTE = _auto_shrink_prompt_pad_for_max_model_len(
+            v1_info.get("max_model_len"),
+            props_slots,
+            is_llamacpp=is_llamacpp,
+        )
+        if _PROMPT_PAD_ADJUST_NOTE.strip():
+            print(
+                "ℹ️  "
+                + _PROMPT_PAD_ADJUST_NOTE.replace("`", "").replace("**", ""),
+                flush=True,
+            )
         if _MAX_TOKENS_SOURCE == "auto":
-            MAX_TOKENS, _MAX_TOKENS_NOTE = resolve_auto_max_tokens(entries, CHAT_MODEL, v1_info)
+            MAX_TOKENS, _MAX_TOKENS_NOTE = resolve_auto_max_tokens(
+                entries,
+                CHAT_MODEL,
+                v1_info,
+                is_llamacpp=is_llamacpp,
+                server_slots=props_slots,
+            )
         else:
-            nt_fixed, suf_ctx = finalize_max_tokens_budget(MAX_TOKENS, v1_info)
+            nt_fixed, suf_ctx = finalize_max_tokens_budget(
+                MAX_TOKENS,
+                v1_info,
+                is_llamacpp=is_llamacpp,
+                server_slots=props_slots,
+            )
             MAX_TOKENS = nt_fixed
             if suf_ctx:
                 _MAX_TOKENS_NOTE += suf_ctx
-
-        prompt_sampling_md = prepare_prompts_for_run()
-
-        print("=====================================================")
-        print(f"端點: {URL}  |  model 欄位: {CHAT_MODEL}")
-        print(
-            f"🔥 開始效能測試—token 產能 (併發: {CONCURRENT_REQUESTS}, max_tokens: {MAX_TOKENS}, "
-            f"temperature: {SAMPLING_TEMPERATURE}, top_p: {SAMPLING_TOP_P}, "
-            f"presence_penalty: {SAMPLING_PRESENCE_PENALTY}, stream: {USE_STREAMING})"
-        )
-        print("📚 模式：題庫 64 題高複合度；本輪自題庫隨機抽「併發數」題且不重複，外加角色扮演 system")
-        print("🎯 指標：總耗時期間內輸出之 completion_tokens 總量 ÷ 總耗時 → 系統 TPS（預設 16 路併發）")
-        print("💡 提示：測試期間請在另一個終端機執行 `watch -n 1 nvidia-smi`")
-        print("=====================================================")
-        _sp_one = CHAT_SYSTEM_PROMPT.replace("\n", " ").strip()
-        _pv = (_sp_one[:140] + "…") if len(_sp_one) > 140 else _sp_one
-        print(f"📜 system（節錄）: {_pv}")
-        print(f"📐 伺服器 context 上界: {_format_ctx_line(v1_info)}")
-        print(
-            f"🎲 抽樣：題庫 64 題，本輪 {CONCURRENT_REQUESTS} 題（random.sample、無重複）；"
-            "環境變數 VLLM_PROMPT_SEED=整數 可固定抽題。"
-        )
-        print(
-            f"📐 本輪請求: max_tokens={MAX_TOKENS}, temperature={SAMPLING_TEMPERATURE}, "
-            f"top_p={SAMPLING_TOP_P}, presence_penalty={SAMPLING_PRESENCE_PENALTY}, "
-            f"stream={'SSE' if USE_STREAMING else 'off'}"
-        )
-        print(
-            f"⏱️ 單請求產出門檻：**{STREAM_GENERATION_TIMEOUT_SEC:g}** s "
-            "（SSE 自開始收 body 計時；逾時終止該請求並寫入報告，`VLLM_STREAM_GENERATION_TIMEOUT` 可調；"
-            "`--no-stream` 時以同門檻包 `wait_for(JSON)`）。"
-        )
-        sse_dash = (
-            _ConcurrentStreamDashboard(CONCURRENT_REQUESTS)
-            if _want_rich_sse_dashboard(USE_STREAMING)
-            else None
-        )
-        if sse_dash is not None:
+        if MAX_TOKENS <= WARN_LOW_MAX_TOKENS:
+            _MAX_TOKENS_NOTE += (
+                f"\n\n> **警告：** 每則 `max_tokens` 僅 **{MAX_TOKENS:,}**（門檻 ≤{WARN_LOW_MAX_TOKENS}），"
+                " 系統 TPS 參考價值通常極低；請提高伺服器實際 n_ctx、縮短填段，或調整"
+                " `VLLM_MIN_GENERATION_HEADROOM_TOKENS`／`VLLM_CHAT_TEMPLATE_RESERVE_TOKENS`。"
+            )
             print(
-                "📺 [Rich Live] 即時更新各路請求之 SSE delta 與累積尾段（"
-                "`VLLM_RICH_LIVE=0`、`--no-rich-live`、或非 TTY 則停用）"
-            )
-            console = Console()
-            opener = Panel(
-                Text.from_markup("[bold]併發測試進行中[/bold]，下方每格對應一個 request id"),
-                subtitle="subtitle 顯示剛收到的片段；正文為總輸出之尾部預覽",
-                border_style="green",
-            )
-            with Live(
-                opener,
-                console=console,
-                transient=True,
-                refresh_per_second=20,
-                vertical_overflow="visible",
-            ) as rich_live:
-                sse_dash.bind_live(rich_live)
-                await sse_dash._paint_async()
-                results = await asyncio.gather(
-                    *[
-                        fetch(session, rid, dashboard=sse_dash)
-                        for rid in range(CONCURRENT_REQUESTS)
-                    ]
-                )
-                sse_dash.bind_live(None)
-        else:
-            results = await asyncio.gather(
-                *[fetch(session, rid) for rid in range(CONCURRENT_REQUESTS)]
+                f"⚠️  max_tokens={MAX_TOKENS} 過低（≤{WARN_LOW_MAX_TOKENS}），請檢查上下文與填段設定。",
+                file=sys.stderr,
+                flush=True,
             )
 
-    total_time = time.time() - start_time
+        sustain = STRESS_SUSTAIN_SEC > 0.0
+        preamble_row = ""
+        wave_stats: list[dict] = []
+
+        if sustain:
+            if STRESS_ROUNDS > 1:
+                stress_profile = (
+                    f"持續 **{STRESS_SUSTAIN_SEC:g}** s、併發 **{CONCURRENT_REQUESTS}** "
+                    "（已指定 --stress-seconds，`--rounds` 省略）"
+                )
+            else:
+                stress_profile = f"持續 **{STRESS_SUSTAIN_SEC:g}** s、併發 **{CONCURRENT_REQUESTS}**"
+            prompt_sampling_md = (
+                "| 項目 | 內容 |\n|:--|:--|\n"
+                f"| 模式 | 持續壓力 **{STRESS_SUSTAIN_SEC:g}** s |\n"
+                "| 題庫 | `random.choice` **可重複**（來自 test_max_tps_topics_64.txt） |\n"
+            )
+            print(
+                f"壓力測試（持續）: -c={CONCURRENT_REQUESTS} × {STRESS_SUSTAIN_SEC:g}s → {URL}  "
+                f"model={CHAT_MODEL!r}  max_tokens={MAX_TOKENS}  cache_prompt={CHAT_CACHE_PROMPT_REQUEST}  "
+                f"temp={SAMPLING_TEMPERATURE:g}/{SAMPLING_TOP_P:g}/pp={SAMPLING_PRESENCE_PENALTY:g}  "
+                f"gen_cap={STREAM_GENERATION_TIMEOUT_SEC:g}s",
+                flush=True,
+            )
+            print("（持續模式不使用 Rich SSE 面板）", flush=True)
+            results = await run_sustained_stress(session)
+        else:
+            if STRESS_ROUNDS > 1:
+                stress_profile = f"連續 **{STRESS_ROUNDS}** 波、每波併發 **{CONCURRENT_REQUESTS}**"
+                _wave_note = "每波 `random.sample` 不重複抽題"
+                if PREFIX_CACHE_TEST:
+                    stress_profile += "（prefix cache 命中測試）"
+                    _wave_note = (
+                        "第 1 波 `random.sample` 抽題（冷啟）；第 2 波起**重用第一波 prompts**"
+                        "（完整 prompt 相同 → 測 prefix cache 命中）"
+                    )
+                preamble_row = (
+                    "| 項目 | 內容 |\n|:--|:--|\n"
+                    f"| 壓力波次 | **{STRESS_ROUNDS}**（{_wave_note}） |\n\n"
+                )
+            results = []
+            rich_ok = (
+                _want_rich_sse_dashboard(USE_STREAMING)
+                and STRESS_ROUNDS == 1
+            )
+            sse_dash: _ConcurrentStreamDashboard | None = (
+                _ConcurrentStreamDashboard(CONCURRENT_REQUESTS) if rich_ok else None
+            )
+            _stream_lbl = "SSE" if USE_STREAMING else "off"
+            if STRESS_ROUNDS == 1:
+                print(
+                    f"執行中: {CONCURRENT_REQUESTS} 併發  {URL}  model={CHAT_MODEL!r}  "
+                    f"max_tokens={MAX_TOKENS}  cache_prompt={CHAT_CACHE_PROMPT_REQUEST}  "
+                    f"temp={SAMPLING_TEMPERATURE:g}/{SAMPLING_TOP_P:g}/pp={SAMPLING_PRESENCE_PENALTY:g}  "
+                    f"stream={_stream_lbl}  gen_cap={STREAM_GENERATION_TIMEOUT_SEC:g}s",
+                    flush=True,
+                )
+            for round_idx in range(STRESS_ROUNDS):
+                reuse_prompts = PREFIX_CACHE_TEST and round_idx > 0
+                _wave_lab = "（prefix cache 命中：重用第一波 prompts）" if reuse_prompts else ""
+                print(
+                    f"\n── 波次 {round_idx + 1}/{STRESS_ROUNDS} ──  {CONCURRENT_REQUESTS} 併發 → {URL}{_wave_lab}",
+                    flush=True,
+                )
+                if not reuse_prompts:
+                    pmd_round = prepare_prompts_for_run()
+                    if round_idx == 0:
+                        prompt_sampling_md = preamble_row + pmd_round
+
+                # reuse_prompts 時不重抽：_CURRENT_RUN_PROMPTS 仍為第一波內容
+                prompts = list(_CURRENT_RUN_PROMPTS)
+                wave_t0 = time.time()
+
+                dash_this = sse_dash if (sse_dash is not None and round_idx == 0) else None
+                if dash_this is not None:
+                    print("[Rich Live] SSE 即時面板（結束後清除畫面）", flush=True)
+                    console = Console()
+                    assert Console is not None and Panel is not None and Live is not None and Text is not None
+                    opener = Panel(
+                        Text.from_markup("[bold]併發測試進行中[/bold]，下方每格對應一個 request id"),
+                        subtitle="subtitle 顯示剛收到的片段；正文為總輸出之尾部預覽",
+                        border_style="green",
+                    )
+                    with Live(
+                        opener,
+                        console=console,
+                        transient=True,
+                        refresh_per_second=20,
+                        vertical_overflow="visible",
+                    ) as rich_live:
+                        dash_this.bind_live(rich_live)
+                        await dash_this._paint_async()
+                        wave = await run_concurrent_wave(session, dash_this, prompts)
+                        dash_this.bind_live(None)
+                else:
+                    wave = await run_concurrent_wave(session, None, prompts)
+                wave_wall = time.time() - wave_t0
+                for w in wave:
+                    w["stress_round"] = round_idx + 1
+                results.extend(wave)
+                _wave_ok = [w for w in wave if w["success"]]
+                _wave_completion = sum(w["tokens"] for w in _wave_ok)
+                wave_stats.append(
+                    {
+                        "round": round_idx + 1,
+                        "prefix_reuse": reuse_prompts,
+                        "wall": wave_wall,
+                        "n_ok": len(_wave_ok),
+                        "n": len(wave),
+                        "completion": _wave_completion,
+                        "prompt": sum(w.get("prompt_tokens", 0) for w in _wave_ok),
+                        "tps": (_wave_completion / wave_wall) if wave_wall > 0 else 0.0,
+                    }
+                )
+
+    total_requests = len(results)
+    total_time = time.time() - glob_start
     n_generation_timeout = sum(
         1
         for r in results
         if r.get("abort_reason") in ("stream_timeout", "nonstream_read_timeout")
     )
-    
+
     # 統計結果
     successful_results = [r for r in results if r["success"]]
     total_completion = sum(r["tokens"] for r in successful_results)
@@ -1288,17 +1880,59 @@ async def main(skip_preflight: bool = False, model_override=None) -> None:
     n_ok = len(successful_results)
     avg_in = (total_prompt / n_ok) if n_ok else 0.0
     avg_out = (total_completion / n_ok) if n_ok else 0.0
-    
+
     if total_time > 0:
         system_tps = total_completion / total_time
     else:
         system_tps = 0
 
-    print("\033[1m\n✅ Token 產能量測完成 — 摘要如下\033[0m")
-    _print_run_summary_terminal(
+    ps_note = f"64 題庫／每波 {CONCURRENT_REQUESTS} 題不重複"
+    if sustain:
+        ps_note = "持續壓力 · 題目可重複"
+    elif STRESS_ROUNDS > 1:
+        ps_note = f"{STRESS_ROUNDS} 波 × {CONCURRENT_REQUESTS} 題／波 · 不重複"
+        if PREFIX_CACHE_TEST:
+            ps_note = f"{STRESS_ROUNDS} 波 × {CONCURRENT_REQUESTS} 題／波 · 第 2 波起重用第一波（prefix cache）"
+
+    # 波次摘要：多波時逐波列出耗時／吞吐；prefix cache 測試時可直接對照冷啟 vs 命中
+    wave_summary_md = ""
+    if len(wave_stats) > 1:
+        wave_summary_md = (
+            "### 波次摘要\n\n"
+            "| 波次 | 模式 | 成功 | 耗時 (s) | prompt Σ | completion Σ | 波次 TPS (tok/s) |\n"
+            "|:--|:--|--:|--:|--:|--:|--:|\n"
+        )
+        for ws in wave_stats:
+            mode = "prefix cache 命中（重用第一波 prompts）" if ws["prefix_reuse"] else "冷啟（新抽題）"
+            wave_summary_md += (
+                f"| {ws['round']} | {mode} | {ws['n_ok']}/{ws['n']} | {ws['wall']:.2f} | "
+                f"{ws['prompt']:,} | {ws['completion']:,} | **{ws['tps']:.2f}** |\n"
+            )
+        base_ws = wave_stats[0]
+        if PREFIX_CACHE_TEST and base_ws["tps"] > 0:
+            hit_ws = [ws for ws in wave_stats if ws["prefix_reuse"]]
+            if hit_ws:
+                best = max(ws["tps"] for ws in hit_ws)
+                wave_summary_md += (
+                    f"\n> Prefix cache 命中波次 TPS 相對第 1 波（冷啟）：**{best / base_ws['tps']:.2f}x**。"
+                    "第 2 波起完整 prompt 與第一波相同，伺服器 `--enable-prefix-caching` 可全段命中、"
+                    "幾乎省去 prefill；差異主要反映 prefill 成本。可對照 vLLM log 之 `Prefix cache hit rate`。\n"
+                )
+        wave_summary_md += "\n---\n\n"
+        print("\n波次摘要:")
+        for ws in wave_stats:
+            mode = "prefix-hit" if ws["prefix_reuse"] else "cold"
+            print(
+                f"  波次{ws['round']} [{mode}]  ok={ws['n_ok']}/{ws['n']}  "
+                f"wall={ws['wall']:.2f}s  completion_Σ={ws['completion']:,}  TPS={ws['tps']:.2f} tok/s",
+                flush=True,
+            )
+
+    _print_run_summary_terminal_compact(
         llm_base=_LLM_BASE,
         chat_model=CHAT_MODEL,
         concurrent_requests=CONCURRENT_REQUESTS,
+        total_requests=total_requests,
         max_tokens=MAX_TOKENS,
         max_tokens_note=_MAX_TOKENS_NOTE,
         temperature=SAMPLING_TEMPERATURE,
@@ -1316,8 +1950,14 @@ async def main(skip_preflight: bool = False, model_override=None) -> None:
         system_tps=system_tps,
         avg_in=avg_in,
         avg_out=avg_out,
-        prompt_sampling_note=f"64 題庫／{CONCURRENT_REQUESTS} 題無重複",
+        prompt_sampling_note=ps_note,
+        stress_label=stress_profile,
     )
+    if _MAX_TOKENS_NOTE.strip():
+        _mn = _MAX_TOKENS_NOTE.replace("`", "").replace("**", "")
+        if len(_mn) > 160:
+            _mn = _mn[:159] + "…"
+        print(f"  max_tokens: {_mn}")
     system_info_md = get_system_info()
     md_head = _format_summary_markdown(
         llm_base=_LLM_BASE,
@@ -1333,6 +1973,7 @@ async def main(skip_preflight: bool = False, model_override=None) -> None:
         n_generation_timeout=n_generation_timeout,
         v1_info=v1_info,
         n_ok=n_ok,
+        total_requests=total_requests,
         total_time=total_time,
         total_prompt=total_prompt,
         total_completion=total_completion,
@@ -1341,6 +1982,10 @@ async def main(skip_preflight: bool = False, model_override=None) -> None:
         avg_in=avg_in,
         avg_out=avg_out,
         prompt_sampling_md=prompt_sampling_md,
+        stress_profile=stress_profile,
+        prompt_pad_target_tokens=PROMPT_PAD_TARGET_TOKENS,
+        cache_prompt_request=CHAT_CACHE_PROMPT_REQUEST,
+        prompt_pad_adjust_note=_PROMPT_PAD_ADJUST_NOTE,
     )
 
     log_filename = _reports_max_tps_md_path()
@@ -1349,11 +1994,18 @@ async def main(skip_preflight: bool = False, model_override=None) -> None:
         f.write("## System prompt（角色扮演）\n\n")
         f.write(f"{CHAT_SYSTEM_PROMPT}\n\n---\n\n")
         f.write(md_head)
+        if wave_summary_md:
+            f.write(wave_summary_md)
         f.write(f"{system_info_md}\n\n---\n\n")
-        
-        for r in sorted(results, key=lambda x: x["id"]):
+
+        for r in sorted(
+            results,
+            key=lambda x: (x.get("stress_round") or 0, x["id"]),
+        ):
+            rnd = r.get("stress_round")
+            rnd_lab = f"（波次 {rnd}）" if rnd is not None else ""
             if r["success"]:
-                f.write(f"## 請求編號: {r['id']}\n")
+                f.write(f"## 請求編號: {r['id']}{rnd_lab}\n")
                 f.write(f"- **耗時:** {r['time']:.2f} 秒\n")
                 f.write(
                     f"- **prompt_tokens:** {r.get('prompt_tokens', 0)}  |  "
@@ -1367,7 +2019,7 @@ async def main(skip_preflight: bool = False, model_override=None) -> None:
             ar = r.get("abort_reason")
             dl = float(r.get("deadline_sec", STREAM_GENERATION_TIMEOUT_SEC))
             if ar == "stream_timeout":
-                f.write(f"## 請求編號: {r['id']}（⚠️ SSE 逾時中斷）\n\n")
+                f.write(f"## 請求編號: {r['id']}{rnd_lab}（⚠️ SSE 逾時中斷）\n\n")
                 f.write(
                     f"- **狀態:** 達 **{dl:g}** s 產出門檻仍未完整收完 SSE；已終止連線。\n"
                 )
@@ -1382,7 +2034,7 @@ async def main(skip_preflight: bool = False, model_override=None) -> None:
                 f.write("---\n\n")
                 continue
             if ar == "nonstream_read_timeout":
-                f.write(f"## 請求編號: {r['id']}（⚠️ 非流式逾時）\n\n")
+                f.write(f"## 請求編號: {r['id']}{rnd_lab}（⚠️ 非流式逾時）\n\n")
                 f.write(
                     f"- **狀態:** **{dl:g}** s 內未讀完整份 JSON；已中止。\n"
                 )
@@ -1390,16 +2042,20 @@ async def main(skip_preflight: bool = False, model_override=None) -> None:
                 f.write(f"### 提問 (Prompt)\n> {r['prompt']}\n\n")
                 f.write("---\n\n")
                 continue
-            f.write(f"## 請求編號: {r['id']}（失敗）\n\n")
+            f.write(f"## 請求編號: {r['id']}{rnd_lab}（失敗）\n\n")
             f.write("- **狀態:** 請求未成功完成（請一併對照終端錯誤訊息）。\n")
+            if r.get("http_status"):
+                f.write(f"- **HTTP 狀態:** {r.get('http_status')}\n")
             if r.get("time", 0) > 0:
                 f.write(f"- **耗時:** {r['time']:.2f} 秒\n")
+            if r.get("error"):
+                err = str(r.get("error", "")).replace("```", "'''")
+                f.write(f"\n### 錯誤摘要\n\n```text\n{err}\n```\n")
             f.write("\n")
             f.write(f"### 提問 (Prompt)\n> {r['prompt']}\n\n")
             f.write("---\n\n")
                 
-    print(f"📄 生成的問答內容已完整寫入日誌檔: \033[93m{log_filename}\033[0m")
-    print("您可以開啟該檔案來檢視模型在併發下的吞吐與回答內容。")
+    print(f"報告: {log_filename}")
 
 if __name__ == "__main__":
     _args = parse_cli()

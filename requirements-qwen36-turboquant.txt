@@ -1,0 +1,10 @@
+# Python + TurboQuant／Qwen3.6-35B-A3B（KV 量化執行期）
+#
+# TurboQuant DynamicCache 實作建議 transformers 5.3+（含 cache_utils.DynamicLayer）。
+# Hub 文件入口：https://huggingface.co/majentik/Qwen3.6-35B-A3B-TurboQuant
+# 實際權重：https://huggingface.co/Qwen/Qwen3.6-35B-A3B（約 ~70 GB BF16，需多台 GPU／量化）
+turboquant>=0.2.0
+transformers>=5.3.0
+accelerate>=0.33.0
+torch>=2.2.0
+bitsandbytes>=0.43.0
