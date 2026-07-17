@@ -61,6 +61,7 @@ Thumbs.db
 
 # Hugging Face & common ML caches (large downloads)
 .cache/
+.hf_cache/
 huggingface/
 
 # Optional: local model / checkpoint dirs (uncomment if you store weights here)
@@ -69,3 +70,6 @@ huggingface/
 
 # Reports
 reports/
+
+# pip CUDA toolkit shim for FlashInfer JIT (lib64 layout)
+.cuda_home/

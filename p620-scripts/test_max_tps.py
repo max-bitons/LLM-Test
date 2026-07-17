@@ -411,6 +411,9 @@ def parse_cli(argv=None) -> argparse.Namespace:
         epilog=(
             "範例:\n"
             "  python p620-scripts/test_max_tps.py\n"
+            "  # Qwen3.6-35B-A3B NVFP4 TP=2（PRO 4000 BW 量能擴充，128K ctx／32 併發／8K 輸出）：\n"
+            "  ./start_vllm_server_qwen36_35b_a3b_turboquant_tp2_pro4000bw_capacity.sh\n"
+            "  ./p620-scripts/run_test_max_tps_qwen36_35b_a3b_turboquant_pro4000_capacity.sh\n"
             "  # Qwen3.5-9B vLLM TP=2（./start_vllm_server_qwen3.5-9B_tp2.sh 預設埠 8002）：\n"
             "  ./p620-scripts/run_test_max_tps_qwen35_9b.sh\n"
             "  python p620-scripts/test_max_tps.py -p 8002\n"
@@ -654,6 +657,7 @@ async def preflight_local_llm(session: aiohttp.ClientSession) -> None:
             "   3) 使用正確基底 URL，例如：\n"
             "      ./p620-scripts/run_test_max_tps_qwen35_9b.sh\n"
             "      ./p620-scripts/run_test_max_tps_qwen36_35b_a3b_turboquant.sh\n"
+            "      ./p620-scripts/run_test_max_tps_qwen36_35b_a3b_turboquant_pro4000_capacity.sh\n"
             "      python p620-scripts/test_max_tps.py -p 8002\n"
             "      python p620-scripts/test_max_tps.py -u http://127.0.0.1:8002\n"
             "      python p620-scripts/test_max_tps.py -u http://127.0.0.1:8004\n"

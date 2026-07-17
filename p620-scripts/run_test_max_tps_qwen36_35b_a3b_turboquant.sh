@@ -14,7 +14,8 @@
 # （指定 --stress-seconds 持續模式時自動不適用。）
 #
 # 另開終端先啟動 vLLM，再執行：
-#   ./p620-scripts/run_test_max_tps_qwen36_35b_a3b_turboquant.sh                 # 預設持續壓力模式
+#   ./p620-scripts/run_test_max_tps_qwen36_35b_a3b_turboquant.sh                 # 預設 8 併發／64K ctx
+#   ./p620-scripts/run_test_max_tps_qwen36_35b_a3b_turboquant_pro4000_capacity.sh  # 32 併發／128K ctx／8K 輸出
 #   ./p620-scripts/run_test_max_tps_qwen36_35b_a3b_turboquant.sh --stress-seconds 180
 #   ./p620-scripts/run_test_max_tps_qwen36_35b_a3b_turboquant.sh -R 3
 #   ./p620-scripts/run_test_max_tps_qwen36_35b_a3b_turboquant.sh --prompt-pad-tokens 16384 --max-tokens 2048
