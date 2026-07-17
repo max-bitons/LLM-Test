@@ -4,7 +4,7 @@
 # 預設模型：**NVIDIA NVFP4**（https://huggingface.co/nvidia/Qwen3.6-35B-A3B-NVFP4）
 #
 # 5060 Ti 預設容量（本腳本預設；PRO 4000 wrapper 覆寫 gpu-mem／併發／文長）：
-#   gpu-memory-utilization=0.88  max-model-len=65536  max-num-seqs=8
+#   gpu-memory-utilization=0.94  max-model-len=65536  max-num-seqs=8
 #
 # PRO 4000 Blackwell 260717 調度優化（已合併，5060／PRO4000 共用）：
 #   --enable-chunked-prefill
@@ -252,7 +252,7 @@ TOOL_CALL_PARSER="${VLLM_TOOL_CALL_PARSER:-qwen3_xml}"
 # KV usage 卡在 96.2%、恆有 1~2 個 Waiting。提高到 0.90（vLLM 預設）每卡
 # 多出 ~1.3GB KV cache（容量估 ~300K+ tokens），8 路可同跑、無 waiting。
 # 若要釋放更多 VRAM 給其他服務，建議 0.80~0.85。
-GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.88}"
+GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.94}"
 
 # 實測（SM120, 260611）：CUDA graphs 對此 hybrid linear-attention 模型提升巨大，
 #   eager：單流 12.1 tok/s、4 併發 46.7 tok/s

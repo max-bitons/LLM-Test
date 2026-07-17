@@ -1,5 +1,6 @@
-# NVIDIA NVFP4（nvidia/Qwen3.6-35B-A3B-NVFP4）需 nightly：./install_vllm_nightly_cu130.sh
-vllm>=0.20.2
+# NVIDIA NVFP4（nvidia/Qwen3.6-35B-A3B-NVFP4）建議 vLLM 0.25+（cu130 torch 2.11）
+# 升級：pip install -U vllm==0.25.1  或 ./install_vllm_nightly_cu130.sh（nightly）
+vllm>=0.25.1
 torch
 transformers
 accelerate
