@@ -13,7 +13,7 @@ DiffusionGemma 特性說明：
   Phase B - Max-Tokens Sweep：長文輸出極限（最大 32768 tokens）
   Phase C - Thinking Mode：思考模式對複雜推理任務的效益評估
 
-對應伺服器啟動腳本: start_vllm_server_diffusiongemma-26b-a4b-nvfp4.sh
+對應伺服器啟動腳本: start_vllm_diffusiongemma-26b-a4b-nvfp4.sh
   - Port: 8003
   - Model: nvidia/diffusiongemma-26B-A4B-IT-NVFP4
   - Max model len: 65536 (64K)
@@ -108,7 +108,7 @@ OUTPUT_JSON = os.path.join(RESULTS_DIR, f"diffusiongemma_report-{_TS}.json")
 
 MD_REPORT_LABELS = {
     "suite_name": "DiffusionGemma 26B A4B IT NVFP4",
-    "startup_script": "start_vllm_server_diffusiongemma-26b-a4b-nvfp4.sh",
+    "startup_script": "start_vllm_diffusiongemma-26b-a4b-nvfp4.sh",
     "server_port": VLLM_API_PORT,
 }
 
@@ -693,7 +693,7 @@ def generate_markdown_report(
 ) -> str:
     lbl = MD_REPORT_LABELS
     suite = lbl.get("suite_name", "DiffusionGemma 26B A4B IT NVFP4")
-    startup_script = lbl.get("startup_script", "start_vllm_server_diffusiongemma-26b-a4b-nvfp4.sh")
+    startup_script = lbl.get("startup_script", "start_vllm_diffusiongemma-26b-a4b-nvfp4.sh")
     server_port = lbl.get("server_port", "8003")
 
     all_results = concurrency_results + max_token_sweep_results + thinking_results

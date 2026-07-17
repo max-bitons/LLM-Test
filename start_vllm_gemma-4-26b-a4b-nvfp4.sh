@@ -14,7 +14,7 @@
 #   emulation：任何組合皆可跑，但最慢（即時反量化），僅作 fallback。
 #
 # 用法（雙卡，建議）：
-#   CUDA_VISIBLE_DEVICES=0,1 ./start_vllm_server_gemma-4-26b-a4b-nvfp4.sh
+#   CUDA_VISIBLE_DEVICES=0,1 ./start_vllm_gemma-4-26b-a4b-nvfp4.sh
 #
 set -euo pipefail
 

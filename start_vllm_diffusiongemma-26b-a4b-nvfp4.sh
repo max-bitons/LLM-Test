@@ -28,11 +28,11 @@
 #   - H100 低批量實測 >1100 tok/s；RTX 5060 Ti 估計 ~200-400 tok/s（FP4 加速後）
 #
 # 用法（雙卡，建議）：
-#   CUDA_VISIBLE_DEVICES=0,1 ./start_vllm_server_diffusiongemma-26b-a4b-nvfp4.sh
+#   CUDA_VISIBLE_DEVICES=0,1 ./start_vllm_diffusiongemma-26b-a4b-nvfp4.sh
 #
 # 環境變數覆寫範例（注意：VLLM_MAX_NUM_SEQS 建議 ≤4，過高會 OOM）：
 #   VLLM_MAX_MODEL_LEN=65536 VLLM_MAX_NUM_SEQS=4 VLLM_API_PORT=8003 \
-#   CUDA_VISIBLE_DEVICES=0,1 ./start_vllm_server_diffusiongemma-26b-a4b-nvfp4.sh
+#   CUDA_VISIBLE_DEVICES=0,1 ./start_vllm_diffusiongemma-26b-a4b-nvfp4.sh
 #
 # create by : bitons & cursor
 set -euo pipefail

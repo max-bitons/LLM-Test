@@ -1,29 +1,36 @@
 #!/usr/bin/env bash
-# vLLM｜Qwen3.6-35B-A3B｜預設雙 GPU（例如 RTX 5060 Ti 16GB ×2）TP=2
+# vLLM｜Qwen3.6-35B-A3B｜RTX 5060 Ti 16GB ×2（預設）｜TP=2
 #
 # 預設模型：**NVIDIA NVFP4**（https://huggingface.co/nvidia/Qwen3.6-35B-A3B-NVFP4）
-# 優化堆疊（對齊 vLLM / NVIDIA recipe，TPS 導向）：
-#   --quantization modelopt       權重 NVFP4（NVIDIA 官方；需 vLLM nightly，見 install_vllm_nightly_cu130.sh）
-#   --kv-cache-dtype fp8        KV cache FP8，省顯存、利於 64K 長上下文
-#   --enable-prefix-caching     共用 prefill 前綴快取（長文填段壓測效益高）
-#   --enable-chunked-prefill    分塊 prefill（VLLM_ENABLE_CHUNKED_PREFILL=1）
-#   --long-prefill-token-threshold 4096  v0.25.1 無 --chunked-prefill-size；Qwen3.6 hybrid 對齊後 block_size=2096，須 ≥ block_size
-#   --max-num-batched-tokens 8192  每步調度 token 上限（須 ≥ long-prefill threshold）
-#   --enable-prefix-caching     共用 prefill 前綴快取（RAG/Agent 重複 system/doc 效益高）
-#   --extended-prefill-warmup   啟動時延伸 prefill kernel warmup（若 nightly 尚無此旗標則改 --enable-flashinfer-autotune）
+#
+# 5060 Ti 預設容量（本腳本預設；PRO 4000 wrapper 覆寫 gpu-mem／併發／文長）：
+#   gpu-memory-utilization=0.88  max-model-len=65536  max-num-seqs=8
+#
+# PRO 4000 Blackwell 260717 調度優化（已合併，5060／PRO4000 共用）：
+#   --enable-chunked-prefill
+#   --long-prefill-token-threshold 4096  hybrid 對齊 block_size=2096，須 ≥ block_size
+#   --max-num-batched-tokens 8192
+#   --enable-prefix-caching
+#   --extended-prefill-warmup（或 --enable-flashinfer-autotune）
+#   CUDA shim（pip cu13 → .cuda_home，FlashInfer JIT）
+#   Marlin MoE（W4A16_NVFP4 checkpoint）
+#   exec 前 unset 非官方 VLLM_* env（v0.25.1 Unknown 警告）
+#
+# 其他堆疊：
+#   --quantization modelopt  --kv-cache-dtype fp8  --moe-backend marlin
+#
 # 覆寫：QWEN_MODEL_ID、VLLM_QUANTIZATION、KV_CACHE_DTYPE、VLLM_ENABLE_PREFIX_CACHING …
-# Hugging Face 續傳：預設 VLLM_HF_PRELOAD=1，啟動 vLLM 前以 hf download 預拉權重（中斷後續傳 .incomplete）；
-#   可設 VLLM_HF_PRELOAD=0 略過；模型已完整快取可設 HF_HUB_OFFLINE=1。
+# Hugging Face 續傳：預設 VLLM_HF_PRELOAD=1；可設 VLLM_HF_PRELOAD=0 或 HF_HUB_OFFLINE=1。
 #
 # 用法：
-#   ./start_vllm_server_qwen36_35b_a3b_turboquant_tp2.sh
-#   CUDA_VISIBLE_DEVICES=0,1 ./start_vllm_server_qwen36_35b_a3b_turboquant_tp2.sh
+#   ./start_vllm_qwen36_35b_a3b_tp2_5060ti.sh                         # 5060 Ti 預設（8 併發／64K）
+#   ./start_vllm_qwen36_35b_a3b_tp2_pro4000.sh                        # PRO 4000 量能 profile
+#   CUDA_VISIBLE_DEVICES=0,1 ./start_vllm_qwen36_35b_a3b_tp2_5060ti.sh
 #
-# 與 p620-scripts/run_test_max_tps_qwen36_35b_a3b_turboquant.sh：預設埠 **8002**、約 **8 併發**、客端約 **56K** 長文填段 + 上下文上界輸出（與其他服務同埠時請改 PORT）
+# 壓測：p620-scripts/run_test_max_tps_qwen36_35b_a3b_turboquant.sh（5060 8 併發／64K）
+#       p620-scripts/run_test_max_tps_qwen36_35b_a3b_turboquant_pro4000.sh（PRO 4000）
 #
-# 覆寫慣例：仍相容舊變數名，但不再 export「非 vLLM 官方」之 VLLM_* 以免造成 Unknown vLLM environment variable：
-#   VLLM_API_PORT、VLLM_MAX_MODEL_LEN、VLLM_MAX_NUM_SEQS、VLLM_MAX_NUM_BATCHED_TOKENS … 僅由本 bash 讀入後改成 CLI；
-#   或直接加在 EXTRA_VLLM_ARGS。
+# 覆寫慣例：VLLM_* 僅由 bash 讀入後改成 CLI；勿 export 給 Python。
 #
 set -euo pipefail
 

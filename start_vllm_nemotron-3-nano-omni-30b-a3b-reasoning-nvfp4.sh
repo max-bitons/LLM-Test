@@ -8,7 +8,7 @@
 #   - long context: >= 64K (default 96K, configurable)
 #
 # Usage:
-#   CUDA_VISIBLE_DEVICES=0,1 ./start_vllm_server_nemotron-3-nano-omni-30b-a3b-reasoning-nvfp4.sh
+#   CUDA_VISIBLE_DEVICES=0,1 ./start_vllm_nemotron-3-nano-omni-30b-a3b-reasoning-nvfp4.sh
 #
 set -euo pipefail
 

@@ -7,7 +7,7 @@ Goals:
 3) Long-context validation >= 64K tokens (approximation by prompt length).
 
 Target startup script:
-  start_vllm_server_nemotron-3-nano-omni-30b-a3b-reasoning-nvfp4.sh
+  start_vllm_nemotron-3-nano-omni-30b-a3b-reasoning-nvfp4.sh
 
 create by : bitons & cursor
 """

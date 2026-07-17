@@ -7,7 +7,7 @@
 # TP=2 後每卡權重約 5.5GB，其餘 VRAM 全留 KV cache 以支援最大長文。
 #
 # 用法（雙卡）：
-#   CUDA_VISIBLE_DEVICES=0,1 ./start_vllm_server_gemma-4-12b-nvfp4.sh
+#   CUDA_VISIBLE_DEVICES=0,1 ./start_vllm_gemma-4-12b-nvfp4.sh
 #
 set -euo pipefail
 

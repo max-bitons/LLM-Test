@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Qwen3.6-35B-A3B NVIDIA NVFP4（vLLM TP=2 + CUDA graphs、marlin MoE）長文壓力測試。
-# 對齊 ./start_vllm_server_qwen36_35b_a3b_turboquant_tp2.sh
+# 對齊 ./start_vllm_qwen36_35b_a3b_tp2_5060ti.sh
 # （nvidia/Qwen3.6-35B-A3B-NVFP4、modelopt、fp8 KV、prefix-caching、
-#   chunked-prefill、max-num-batched-tokens=8192、extended-prefill-warmup、port 8002、64K ctx）。
+#   chunked-prefill、long-prefill-threshold=4096、max-num-batched-tokens=8192、port 8002、64K ctx）。
 # 260611 實測：CUDA graphs 後短文單流 148 tok/s、4 併發 327 tok/s（eager 為 12.1/46.7）。
 #
 # 預設：**8 併發**、user 填段約 **56K tokens**（長 prefill）、輸出採上下文剩餘上界（長生成）。
@@ -14,8 +14,8 @@
 # （指定 --stress-seconds 持續模式時自動不適用。）
 #
 # 另開終端先啟動 vLLM，再執行：
-#   ./p620-scripts/run_test_max_tps_qwen36_35b_a3b_turboquant.sh                 # 預設 8 併發／64K ctx
-#   ./p620-scripts/run_test_max_tps_qwen36_35b_a3b_turboquant_pro4000_capacity.sh  # 32 併發／128K ctx／8K 輸出
+#   ./p620-scripts/run_test_max_tps_qwen36_35b_a3b_turboquant.sh                 # 5060：8 併發／64K ctx
+#   ./p620-scripts/run_test_max_tps_qwen36_35b_a3b_turboquant_pro4000.sh       # PRO 4000：24 併發／96K ctx／8K 輸出
 #   ./p620-scripts/run_test_max_tps_qwen36_35b_a3b_turboquant.sh --stress-seconds 180
 #   ./p620-scripts/run_test_max_tps_qwen36_35b_a3b_turboquant.sh -R 3
 #   ./p620-scripts/run_test_max_tps_qwen36_35b_a3b_turboquant.sh --prompt-pad-tokens 16384 --max-tokens 2048
@@ -42,7 +42,7 @@ export VLLM_PREFIX_CACHE_TEST="${VLLM_PREFIX_CACHE_TEST:-1}"
 export VLLM_STRESS_SECONDS="${VLLM_STRESS_SECONDS:-180}"
 if command -v curl >/dev/null 2>&1; then
     if ! curl -sf --max-time 3 "${LLM_BASE_URL}/v1/models" >/dev/null 2>&1; then
-        printf '\n⚠️  預檢：尚未連到 LLM_BASE_URL=%s。\n請在另一終端於專案根目錄先啟動：\n  %s/start_vllm_server_qwen36_35b_a3b_turboquant_tp2.sh\n若伺服器已在其他埠，請：LLM_BASE_URL=http://127.0.0.1:<埠號> "%s/run_test_max_tps_qwen36_35b_a3b_turboquant.sh"\n\n' \
+        printf '\n⚠️  預檢：尚未連到 LLM_BASE_URL=%s。\n請在另一終端於專案根目錄先啟動：\n  %s/start_vllm_qwen36_35b_a3b_tp2_5060ti.sh\n若伺服器已在其他埠，請：LLM_BASE_URL=http://127.0.0.1:<埠號> "%s/run_test_max_tps_qwen36_35b_a3b_turboquant.sh"\n\n' \
             "${LLM_BASE_URL}" "${REPO_ROOT}" "${SCRIPT_DIR}" >&2
     fi
 fi

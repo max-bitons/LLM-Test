@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4（vLLM TP=2）長文壓力測試。
-# 對齊 ./start_vllm_server_nemotron-3-nano-omni-30b-a3b-reasoning-nvfp4.sh
+# 對齊 ./start_vllm_nemotron-3-nano-omni-30b-a3b-reasoning-nvfp4.sh
 # （nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4、modelopt_fp4、fp8 KV、
 #   prefix-caching、chunked-prefill、port 8010）。
 #
@@ -67,7 +67,7 @@ esac
 
 if command -v curl >/dev/null 2>&1; then
     if ! curl -sf --max-time 3 "${LLM_BASE_URL}/v1/models" >/dev/null 2>&1; then
-        printf '\n⚠️  預檢：尚未連到 LLM_BASE_URL=%s。\n請在另一終端於專案根目錄先啟動：\n  CUDA_VISIBLE_DEVICES=0,1 %s/start_vllm_server_nemotron-3-nano-omni-30b-a3b-reasoning-nvfp4.sh\n若伺服器已在其他埠，請：LLM_BASE_URL=http://127.0.0.1:<埠號> "%s/run_test_max_tps_nemotron3_nano_omni_30b_a3b_reasoning_nvfp4.sh"\n\n' \
+        printf '\n⚠️  預檢：尚未連到 LLM_BASE_URL=%s。\n請在另一終端於專案根目錄先啟動：\n  CUDA_VISIBLE_DEVICES=0,1 %s/start_vllm_nemotron-3-nano-omni-30b-a3b-reasoning-nvfp4.sh\n若伺服器已在其他埠，請：LLM_BASE_URL=http://127.0.0.1:<埠號> "%s/run_test_max_tps_nemotron3_nano_omni_30b_a3b_reasoning_nvfp4.sh"\n\n' \
             "${LLM_BASE_URL}" "${REPO_ROOT}" "${SCRIPT_DIR}" >&2
     fi
 fi
