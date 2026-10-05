@@ -219,14 +219,34 @@ async def lifespan(app: FastAPI):
         if IMAGE_BACKEND == "flux2_gguf":
             pipeline, USE_REMOTE_FLUX2_TE = load_flux2_gguf_pipeline()
             print(f"Flux2 GGUF hybrid pipeline ready (remote text encoder: {USE_REMOTE_FLUX2_TE}).")
+        elif IMAGE_BACKEND == "chroma":
+            from diffusers import ChromaPipeline
+
+            dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+            print(f"Loading Chroma pipeline: {MODEL_ID} dtype={dtype} ...")
+            chroma_kw = dict(torch_dtype=dtype)
+            hf_tok = _hf_explicit_token()
+            if hf_tok:
+                chroma_kw["token"] = hf_tok
+            pipeline = ChromaPipeline.from_pretrained(MODEL_ID, **chroma_kw)
+            if torch.cuda.is_available():
+                pipeline = pipeline.to(device)
+            if hasattr(pipeline, "safety_checker"):
+                pipeline.safety_checker = None
+            if hasattr(pipeline, "requires_safety_checker"):
+                pipeline.requires_safety_checker = False
+            USE_REMOTE_FLUX2_TE = False
+            print(f"Chroma {MODEL_ID} loaded on {device} (no safety checker).")
         else:
             dtype = torch.float16 if torch.cuda.is_available() else torch.float32
             print(f"Loading SDXL / AutoPipeline: {MODEL_ID} ...")
-            pipeline = AutoPipelineForText2Image.from_pretrained(
-                MODEL_ID,
-                torch_dtype=dtype,
-                use_safetensors=True,
-            )
+            load_kw = dict(torch_dtype=dtype, use_safetensors=True)
+            hf_tok = _hf_explicit_token()
+            if hf_tok:
+                load_kw["token"] = hf_tok
+            if dtype == torch.float16:
+                load_kw["variant"] = "fp16"
+            pipeline = AutoPipelineForText2Image.from_pretrained(MODEL_ID, **load_kw)
             pipeline = pipeline.to(device)
             USE_REMOTE_FLUX2_TE = False
             print(f"Model {MODEL_ID} loaded successfully on {device}.")
@@ -289,6 +309,14 @@ def _resolved_steps_gs(request: ImageGenerationRequest) -> tuple[int, float]:
         gs = request.guidance_scale
         if gs is None:
             gs = float(os.getenv("FLUX2_DEFAULT_GUIDANCE", "4.0"))
+        return steps, gs
+    if IMAGE_BACKEND == "chroma":
+        steps = request.num_inference_steps
+        if steps is None:
+            steps = int(os.getenv("CHROMA_DEFAULT_STEPS", "40"))
+        gs = request.guidance_scale
+        if gs is None:
+            gs = float(os.getenv("CHROMA_DEFAULT_GUIDANCE", "3.0"))
         return steps, gs
     steps = request.num_inference_steps if request.num_inference_steps is not None else 20
     gs = request.guidance_scale if request.guidance_scale is not None else 7.5
@@ -358,6 +386,22 @@ def _run_pipeline_sync(request: ImageGenerationRequest) -> List[ImageResponseDat
                 **flux_kwargs,
             )
             images = list(out.images)
+    elif IMAGE_BACKEND == "chroma":
+        gen = generator
+        if request.seed is not None:
+            gen = torch.Generator(device="cpu").manual_seed(request.seed)
+        out = pipeline(
+            prompt=request.prompt,
+            negative_prompt=request.negative_prompt,
+            num_images_per_prompt=request.n or 1,
+            num_inference_steps=steps,
+            guidance_scale=gs,
+            height=height,
+            width=width,
+            generator=gen,
+            max_sequence_length=int(os.getenv("CHROMA_MAX_SEQ_LEN", "512")),
+        )
+        images = list(out.images)
     else:
         out = pipeline(
             prompt=request.prompt,

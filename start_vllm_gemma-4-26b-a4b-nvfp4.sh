@@ -13,8 +13,10 @@
 #     marlin             → ✅ 可跑且輸出正確；4 併發 aggregate ~90 tok/s（emulation 約 37，2.4 倍）
 #   emulation：任何組合皆可跑，但最慢（即時反量化），僅作 fallback。
 #
-# 用法（雙卡，建議）：
-#   CUDA_VISIBLE_DEVICES=0,1 ./start_vllm_gemma-4-26b-a4b-nvfp4.sh
+# 用法：
+#   CUDA_VISIBLE_DEVICES=0,1 ./start_vllm_gemma-4-26b-a4b-nvfp4.sh   # 雙卡 TP=2+EP
+#   ./start_vllm_gemma-4-26b-a4b_DGX.sh                               # GB10 單卡 TP=1
+#   VLLM_TENSOR_PARALLEL_SIZE=1 ./start_vllm_gemma-4-26b-a4b-nvfp4.sh
 #
 set -euo pipefail
 
@@ -71,8 +73,15 @@ _visible_gpu_count() {
 }
 
 _gc=$(_visible_gpu_count)
-if ! [ "${_gc:-0}" -ge 2 ] 2>/dev/null; then
-    printf '[ERROR] 此 NVFP4 檢查點在 16GB 級 GPU 需至少 2 張可見卡（TP=2）。\n' >&2
+# 預設 TP：可見卡 ≥2 → 2（16GB 級雙卡）；單卡大記憶體（如 GB10）→ 1
+VLLM_TENSOR_PARALLEL_SIZE="${VLLM_TENSOR_PARALLEL_SIZE:-$([ "${_gc:-0}" -ge 2 ] && echo 2 || echo 1)}"
+if [ "${VLLM_TENSOR_PARALLEL_SIZE}" -ge 2 ] && ! [ "${_gc:-0}" -ge 2 ] 2>/dev/null; then
+    printf '[ERROR] TP=%s 需要至少 2 張可見卡（目前 %s）。\n' \
+        "$VLLM_TENSOR_PARALLEL_SIZE" "${_gc:-0}" >&2
+    exit 1
+fi
+if [ "${VLLM_TENSOR_PARALLEL_SIZE}" -eq 1 ] && ! [ "${_gc:-0}" -ge 1 ] 2>/dev/null; then
+    printf '[ERROR] 找不到可見 GPU。\n' >&2
     exit 1
 fi
 GPU_COUNT="${_gc:-0}"
@@ -97,28 +106,43 @@ VLLM_QUANTIZATION="${VLLM_QUANTIZATION:-modelopt_fp4}"
 # marlin 需搭配 EP（見檔頭實測矩陣）；fallback：VLLM_MOE_BACKEND=emulation
 MOE_BACKEND="${VLLM_MOE_BACKEND:-marlin}"
 KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8}"
+# 直接指定 KV cache 記憶體（bytes）；空值＝交由 gpu-memory-utilization 推算。
+KV_CACHE_MEMORY_BYTES="${VLLM_KV_CACHE_MEMORY_BYTES:-}"
 ENABLE_PREFIX_CACHING="${VLLM_ENABLE_PREFIX_CACHING:-1}"
 ENABLE_FLASHINFER="${VLLM_ENABLE_FLASHINFER:-1}"
 # 0.80 在 64K context 下 KV cache 不足（需 1.14 GiB、僅剩 0.95 GiB），調至 0.85
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.85}"
 
-VLLM_TENSOR_PARALLEL_SIZE="${VLLM_TENSOR_PARALLEL_SIZE:-2}"
-# marlin backend 必須開 EP（避免 expert intermediate 被 TP 切成 352 而無合法 kernel）
-VLLM_ENABLE_EXPERT_PARALLEL="${VLLM_ENABLE_EXPERT_PARALLEL:-1}"
+# TP≥2 時 marlin 必須開 EP（避免 expert intermediate 被 TP 切成 352）；TP=1 預設關
+if [ "${VLLM_TENSOR_PARALLEL_SIZE}" -ge 2 ]; then
+    VLLM_ENABLE_EXPERT_PARALLEL="${VLLM_ENABLE_EXPERT_PARALLEL:-1}"
+else
+    VLLM_ENABLE_EXPERT_PARALLEL="${VLLM_ENABLE_EXPERT_PARALLEL:-0}"
+fi
 
 EXTRA_VLLM_ARGS="${EXTRA_VLLM_ARGS:-}"
-if [ "${VLLM_ENFORCE_EAGER:-1}" = "1" ]; then
+# 雙卡 16GB 預設 eager；單卡大記憶體（DGX）可設 VLLM_ENFORCE_EAGER=0 開 CUDA graph
+_DEFAULT_EAGER=1
+[ "${VLLM_TENSOR_PARALLEL_SIZE}" -eq 1 ] && _DEFAULT_EAGER=0
+if [ "${VLLM_ENFORCE_EAGER:-${_DEFAULT_EAGER}}" = "1" ]; then
     if [[ " ${EXTRA_VLLM_ARGS} " != *" --enforce-eager"* ]]; then
         EXTRA_VLLM_ARGS="${EXTRA_VLLM_ARGS:+${EXTRA_VLLM_ARGS} }--enforce-eager"
     fi
 fi
+unset _DEFAULT_EAGER
 
 VLLM_VERSION=$(python -c "import vllm; print(getattr(vllm, '__version__', 'unknown'))" 2>/dev/null || echo "unknown")
 
 printf '\n┌──────────────────────────────────────────────────────────────┐\n'
 printf '│ %-60s │\n' "vLLM｜Gemma 4 26B｜HIGH-TPS OPT｜TP=${VLLM_TENSOR_PARALLEL_SIZE}｜port=${PORT}"
 printf '└──────────────────────────────────────────────────────────────┘\n'
-printf '  max-num-seqs=%s  batched-tokens=%s  chunk-size=%s\n\n' "$_MAX_SEQS" "$_BATCHED" "$_CHUNK_SIZE"
+printf '  max-num-seqs=%s  batched-tokens=%s  chunk-size=%s  moe=%s  ep=%s\n' \
+    "$_MAX_SEQS" "$_BATCHED" "$_CHUNK_SIZE" "$MOE_BACKEND" "$VLLM_ENABLE_EXPERT_PARALLEL"
+if [ -n "$KV_CACHE_MEMORY_BYTES" ]; then
+    printf '  kv-cache-memory-bytes=%s（≈%s GiB）\n' \
+        "$KV_CACHE_MEMORY_BYTES" "$(( KV_CACHE_MEMORY_BYTES / 1073741824 ))"
+fi
+printf '\n'
 
 _hf_preload_model() {
     if [ "${VLLM_HF_PRELOAD:-1}" != "1" ] || [ "${HF_HUB_OFFLINE:-0}" = "1" ]; then
@@ -179,6 +203,14 @@ if [ "$EXTENDED_PREFILL_WARMUP" = "1" ]; then
 fi
 
 OPT_MOE="$(_pick_flag "--moe-backend" --moe-backend "$MOE_BACKEND")"
+OPT_KV_MEM=""
+if [ -n "$KV_CACHE_MEMORY_BYTES" ]; then
+    OPT_KV_MEM="$(_pick_flag "--kv-cache-memory-bytes" --kv-cache-memory-bytes "$KV_CACHE_MEMORY_BYTES")"
+    if [ -z "${OPT_KV_MEM// /}" ]; then
+        printf '[WARN] 此 vLLM 不支援 --kv-cache-memory-bytes，KV cache 改由 gpu-memory-utilization=%s 推算。\n' \
+            "$GPU_MEMORY_UTILIZATION" >&2
+    fi
+fi
 OPT_EP=""
 if [ "${VLLM_ENABLE_EXPERT_PARALLEL:-0}" = "1" ]; then
     OPT_EP="$(_pick_flag "--enable-expert-parallel" --enable-expert-parallel)"
@@ -204,8 +236,15 @@ fi
 
 unset _vllm_help
 
+# transformers>=5.15：Gemma4 per-layer head_dim 與 vLLM 0.27 不相容，經 boot wrapper 修正
+_VLLM_PY=(python)
+if python -c "import transformers as t; raise SystemExit(0 if tuple(int(x) for x in t.__version__.split('.')[:2]) >= (5, 15) else 1)" 2>/dev/null; then
+    _VLLM_PY=(python "${SCRIPT_DIR}/scripts/vllm_boot_gemma4_tf515_compat.py")
+    printf '[INFO] transformers>=5.15 → 使用 Gemma4 heterogeneous config boot wrapper\n'
+fi
+
 # shellcheck disable=SC2086
-exec python -m vllm.entrypoints.openai.api_server \
+exec "${_VLLM_PY[@]}" -m vllm.entrypoints.openai.api_server \
     --model "$MODEL_ID" \
     $OPT_TP \
     --dtype auto \
@@ -216,6 +255,7 @@ exec python -m vllm.entrypoints.openai.api_server \
     --max-num-seqs "$_MAX_SEQS" \
     $OPT_QUANT \
     $OPT_KV \
+    $OPT_KV_MEM \
     $OPT_PREFIX \
     $OPT_FLASHINFER \
     $OPT_CHUNK \

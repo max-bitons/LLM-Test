@@ -15,6 +15,7 @@
 # 另開終端先啟動 vLLM，再執行：
 #   ./p620-scripts/run_test_max_tps_qwen36_35b_a3b_turboquant.sh                 # 5060：單輪 8 併發／64K ctx
 #   ./p620-scripts/run_test_max_tps_qwen36_35b_a3b_turboquant_pro4000.sh       # PRO 4000：24 併發／96K ctx／8K 輸出
+#   ./p620-scripts/run_test_max_tps_qwen36_35b_a3b_turboquant_DGX.sh           # DGX Spark：4 併發／64K ctx
 #   ./p620-scripts/run_test_max_tps_qwen36_35b_a3b_turboquant.sh --stress-seconds 180
 #   ./p620-scripts/run_test_max_tps_qwen36_35b_a3b_turboquant.sh -R 3
 #   VLLM_PREFIX_CACHE_TEST=1 ./p620-scripts/run_test_max_tps_qwen36_35b_a3b_turboquant.sh

@@ -1,35 +1,24 @@
 #!/usr/bin/env bash
-# vLLM｜Qwen3.6-35B-A3B｜RTX 5060 Ti 16GB ×2（預設）｜TP=2
+# vLLM｜Qwen3.8-27B｜Unsloth Dynamic NVFP4（dense、compressed-tensors）
+# https://huggingface.co/unsloth/Qwen3.8-27B-NVFP4
 #
-# 預設模型：**NVIDIA NVFP4**（https://huggingface.co/nvidia/Qwen3.6-35B-A3B-NVFP4）
+# 檢查點：
+#   Unsloth Dynamic V3.0 NVFP4（W4A4 + 敏感層 FP8；lm_head 為 FP8）
+#   僅支援 vLLM（SGLang 無法載入 FP8 lm_head）
+#   dense hybrid（Gated DeltaNet + Gated Attention），無 MoE → 勿設 --moe-backend
+#   （強制 marlin 會退化成 W4A16，約 2.5× 更慢；交給 vLLM 選 cute-DSL / cutlass）
+#   原生 262,144 tokens；MTP 權重內建（VLLM_ENABLE_MTP=1 開啟投機解碼）
 #
-# 5060 Ti 預設容量（本腳本預設；PRO 4000 wrapper 覆寫 gpu-mem／併發／文長）：
-#   gpu-memory-utilization=0.94  max-model-len=65536  max-num-seqs=8
-#
-# PRO 4000 Blackwell 260717 調度優化（已合併，5060／PRO4000 共用）：
-#   --enable-chunked-prefill
-#   --long-prefill-token-threshold 4096  hybrid 對齊 block_size=2096，須 ≥ block_size
-#   --max-num-batched-tokens 8192
-#   --enable-prefix-caching
-#   --extended-prefill-warmup（或 --enable-flashinfer-autotune）
-#   CUDA shim（pip cu13 → .cuda_home，FlashInfer JIT）
-#   Marlin MoE（W4A16_NVFP4 checkpoint）
-#   exec 前 unset 非官方 VLLM_* env（v0.25.1 Unknown 警告）
-#
-# 其他堆疊：
-#   --quantization modelopt  --kv-cache-dtype fp8  --moe-backend marlin
-#
-# 覆寫：QWEN_MODEL_ID、VLLM_QUANTIZATION、KV_CACHE_DTYPE、VLLM_ENABLE_PREFIX_CACHING …
-# Hugging Face 續傳：預設 VLLM_HF_PRELOAD=1；可設 VLLM_HF_PRELOAD=0 或 HF_HUB_OFFLINE=1。
+# DGX Spark（GB10）：請用 ./start_vllm_qwen38_27b_nvfp4_DGX.sh
+#   並設 CUTE_DSL_ARCH=sm_121a（wrapper 已處理）
 #
 # 用法：
-#   ./start_vllm_qwen36_35b_a3b_tp2_5060ti.sh                         # 5060 Ti 預設（8 併發／64K）
-#   ./start_vllm_qwen36_35b_a3b_tp2_pro4000.sh                        # PRO 4000 量能 profile
-#   ./start_vllm_qwen36_35b_a3b_DGX.sh                                # DGX Spark 單卡（TP=1、64GiB KV）
-#   CUDA_VISIBLE_DEVICES=0,1 ./start_vllm_qwen36_35b_a3b_tp2_5060ti.sh
+#   ./start_vllm_qwen38_27b_nvfp4.sh
+#   ./start_vllm_qwen38_27b_nvfp4_DGX.sh
+#   VLLM_ENABLE_MTP=1 ./start_vllm_qwen38_27b_nvfp4.sh
+#   VLLM_LANGUAGE_MODEL_ONLY=0 ./start_vllm_qwen38_27b_nvfp4.sh   # 開 vision
 #
-# 壓測：p620-scripts/run_test_max_tps_qwen36_35b_a3b_turboquant.sh（5060 8 併發／64K）
-#       p620-scripts/run_test_max_tps_qwen36_35b_a3b_turboquant_pro4000.sh（PRO 4000）
+# 壓測：./p620-scripts/run_test_max_tps_qwen38_27b_nvfp4_DGX.sh
 #
 # 覆寫慣例：VLLM_* 僅由 bash 讀入後改成 CLI；勿 export 給 Python。
 #
@@ -49,7 +38,7 @@ else
     exit 1
 fi
 
-# FlashInfer / deep_gemm JIT 需要 nvcc + CUDA_HOME。本機常只有 pip 的 nvidia-cu13，
+# FlashInfer / cute-DSL JIT 需要 nvcc + CUDA_HOME。本機常只有 pip 的 nvidia-cu13，
 # 沒有系統 /usr/local/cuda。pip 套件用 lib/、且只有 libcudart.so.N，但 FlashInfer
 # 寫死 -L$CUDA_HOME/lib64 -lcudart，因此建立專案內 shim（.cuda_home）。
 _resolve_cuda_home() {
@@ -70,7 +59,6 @@ _resolve_cuda_home() {
     return 1
 }
 
-# 把 pip nvidia/cu13 包成 FlashInfer 期望的 toolkit 佈局（可寫入專案目錄）。
 _build_cuda_home_shim() {
     local src="$1" shim="$2" so
     mkdir -p "${shim}/lib64/stubs"
@@ -78,7 +66,6 @@ _build_cuda_home_shim() {
     ln -sfn "${src}/include" "${shim}/include"
     [ -d "${src}/nvvm" ] && ln -sfn "${src}/nvvm" "${shim}/nvvm"
     [ -d "${src}/cccl" ] && ln -sfn "${src}/cccl" "${shim}/cccl"
-    # lib64：指向實際 .so，並補未版本化 libcudart.so
     if [ -d "${src}/lib" ]; then
         ln -sfn "${src}/lib/"*.so* "${shim}/lib64/" 2>/dev/null || true
         ln -sfn "${src}/lib/"*.a "${shim}/lib64/" 2>/dev/null || true
@@ -86,7 +73,6 @@ _build_cuda_home_shim() {
         ln -sfn "${src}/lib64/"*.so* "${shim}/lib64/" 2>/dev/null || true
         ln -sfn "${src}/lib64/"*.a "${shim}/lib64/" 2>/dev/null || true
     fi
-    # FlashInfer 連結時使用 -lcudart -lcublas -lcublasLt 等未版本化名稱。
     for so in "${shim}/lib64"/lib*.so.*; do
         [ -e "$so" ] || continue
         base="$(basename "$so")"
@@ -114,12 +100,16 @@ _build_cuda_home_shim() {
 
 if _resolve_cuda_home; then
     _cuda_src="${CUDA_HOME}"
-    # 系統 /usr/local/cuda 已有標準 lib64 時不必 shim；pip cu13 則一定要。
+    _use_ld_path_prepend=0
+    # 系統 /usr/local/cuda 已有標準 lib64 時不必 shim，也不可把 toolkit lib64
+    # 插到 LD_LIBRARY_PATH 最前：會蓋掉 PyTorch 自帶 libcudart，GB10 上
+    # cuInit 回 CUDA_ERROR_NO_DEVICE（EngineCore: No CUDA GPUs are available）。
     if [ ! -e "${CUDA_HOME}/lib64/libcudart.so" ] && [ ! -e "${CUDA_HOME}/lib/libcudart.so" ]; then
         _shim="${SCRIPT_DIR}/.cuda_home"
         if ! _build_cuda_home_shim "${_cuda_src}" "${_shim}"; then
             exit 1
         fi
+        _use_ld_path_prepend=1
         printf '[INFO] 使用 CUDA shim：%s（來源 %s）\n' "$CUDA_HOME" "${_cuda_src}"
     fi
     case ":${PATH}:" in
@@ -129,10 +119,12 @@ if _resolve_cuda_home; then
     export CUDA_PATH="${CUDA_PATH:-${CUDA_HOME}}"
     _libdir="${CUDA_HOME}/lib64"
     [ -d "${_libdir}" ] || _libdir="${CUDA_HOME}/lib"
-    export LD_LIBRARY_PATH="${_libdir}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
-    export LIBRARY_PATH="${_libdir}${LIBRARY_PATH:+:${LIBRARY_PATH}}"
-    printf '[INFO] CUDA_HOME=%s (nvcc=%s)\n' "$CUDA_HOME" "$(command -v nvcc 2>/dev/null || true)"
-    # FlashInfer CCCL：nvcc major.minor 必須與 cuda_runtime_api.h 的 CUDART_VERSION 一致
+    if [ "${_use_ld_path_prepend}" = "1" ]; then
+        export LD_LIBRARY_PATH="${_libdir}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+        export LIBRARY_PATH="${_libdir}${LIBRARY_PATH:+:${LIBRARY_PATH}}"
+    fi
+    printf '[INFO] CUDA_HOME=%s (nvcc=%s)  ld_path_prepend=%s\n' \
+        "$CUDA_HOME" "$(command -v nvcc 2>/dev/null || true)" "${_use_ld_path_prepend}"
     _nvcc_ver="$(nvcc --version 2>/dev/null | sed -n 's/.*release \([0-9]\+\.[0-9]\+\).*/\1/p' | head -1)"
     _cudart_ver="$(python - <<'PY' 2>/dev/null || true
 import re, pathlib, os
@@ -151,7 +143,7 @@ PY
         printf '       pip install "nvidia-cuda-nvcc==13.0.88" "nvidia-nvvm==13.0.88" "nvidia-cuda-crt==13.0.88"\n' >&2
         exit 1
     fi
-    unset _nvcc_ver _cudart_ver _cuda_src _shim _libdir
+    unset _nvcc_ver _cudart_ver _cuda_src _shim _libdir _use_ld_path_prepend
 else
     printf '[ERROR] 找不到 nvcc／CUDA_HOME（預設 /usr/local/cuda 也不存在）。\n' >&2
     printf '       FlashInfer JIT 編譯會失敗。請安裝 CUDA toolkit，或確認 venv 有 nvidia-cu13。\n' >&2
@@ -167,13 +159,14 @@ fi
 
 export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
 if [ -z "${OMP_NUM_THREADS+x}" ]; then
-    export OMP_NUM_THREADS=8
-    export MKL_NUM_THREADS=8
+    _cpu_cores="$(command -v nproc >/dev/null 2>&1 && nproc || echo 8)"
+    export OMP_NUM_THREADS="${_cpu_cores}"
+    export MKL_NUM_THREADS="${_cpu_cores}"
+    unset _cpu_cores
 fi
 
-# 限制 CUDA 編譯併行，避免 cicc 同時過多導致記憶體暴衝。
-# MAX_JOBS：ninja/torch extension 併行上限；保守預設為 4。
 export MAX_JOBS="${MAX_JOBS:-4}"
+export FLASHINFER_NVCC_THREADS="${FLASHINFER_NVCC_THREADS:-2}"
 
 _visible_gpu_count() {
     if ! command -v nvidia-smi >/dev/null 2>&1; then
@@ -183,99 +176,121 @@ _visible_gpu_count() {
     nvidia-smi -L 2>/dev/null | grep -c '^GPU' || true
 }
 
-# TP 大小可覆寫（DGX 單卡 wrapper 設 1；預設維持 2）
-TP_SIZE="${VLLM_TENSOR_PARALLEL_SIZE:-2}"
+# GB10 為主 GPU，FLR（nvidia-smi -r）不可用；若已進入 recovery，CUDA 會回 NO_DEVICE。
+# 只看 Product Brand / GPU Recovery Action 欄位，勿用整份 -q 全文（內含
+# 「Replays Since Reset」等字樣，健康狀態也會誤判）。
+_gpu_requires_reset() {
+    local q action brand
+    q="$(nvidia-smi -q 2>/dev/null || true)"
+    [ -n "$q" ] || return 1
+    brand="$(printf '%s\n' "$q" | awk -F: '/Product Brand/ {gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2; exit}')"
+    action="$(printf '%s\n' "$q" | awk -F: '/GPU Recovery Action/ {gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2; exit}')"
+    case "$brand" in
+        *"GPU requires reset"*) return 0 ;;
+    esac
+    case "$action" in
+        Reset|Reboot) return 0 ;;
+    esac
+    return 1
+}
+
 _gc=$(_visible_gpu_count)
+TP_SIZE="${VLLM_TENSOR_PARALLEL_SIZE:-$([ "${_gc:-0}" -ge 2 ] && echo 2 || echo 1)}"
 if ! [ "${_gc:-0}" -ge "${TP_SIZE}" ] 2>/dev/null; then
     printf '[ERROR] TP=%s 需要至少 %s 張目前可見的 GPU（nvidia-smi -L 計得 %s）。\n' \
         "${TP_SIZE}" "${TP_SIZE}" "${_gc:-0}" >&2
     printf '       請使用 CUDA_VISIBLE_DEVICES 或檢查驅動。\n' >&2
     exit 1
 fi
+# EngineCore 子行程靠 CUDA runtime 看卡；空字串會變成 cuInit NO_DEVICE
+if [ -z "${CUDA_VISIBLE_DEVICES:-}" ]; then
+    if [ "${TP_SIZE}" -eq 1 ]; then
+        export CUDA_VISIBLE_DEVICES=0
+    else
+        export CUDA_VISIBLE_DEVICES="$(seq -s, 0 $((TP_SIZE - 1)))"
+    fi
+fi
 unset _gc
+
+if _gpu_requires_reset; then
+    printf '[ERROR] GPU 處於 recovery（nvidia-smi：GPU requires reset / Recovery Action=Reset）。\n' >&2
+    printf '       CUDA runtime 會回 No CUDA GPUs are available。GB10 是主 GPU，nvidia-smi -r 無法重置。\n' >&2
+    printf '       請重開機後再執行此腳本。\n' >&2
+    exit 1
+fi
+
+if ! python -c "import torch; torch.zeros(1, device='cuda')" >/dev/null 2>&1; then
+    printf '[ERROR] PyTorch 無法初始化 CUDA（torch.zeros on cuda 失敗）。\n' >&2
+    printf '       CUDA_VISIBLE_DEVICES=%s  CUDA_HOME=%s\n' \
+        "${CUDA_VISIBLE_DEVICES-<unset>}" "${CUDA_HOME-<unset>}" >&2
+    printf '       LD_LIBRARY_PATH=%s\n' "${LD_LIBRARY_PATH-<unset>}" >&2
+    python -c "import torch; print('is_available', torch.cuda.is_available(), 'count', torch.cuda.device_count()); torch.zeros(1, device='cuda')" >&2 || true
+    exit 1
+fi
 
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export PYTHONPATH="${SCRIPT_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
 
-# FlashInfer autotune buckets（補齊 fp8_gemm 警告缺漏 shape，例如 95、325、782、1104、6293）
 FLASHINFER_TUNING_BUCKETS_DEFAULT="1,2,4,8,16,32,64,95,116,127,128,256,325,512,768,782,1024,1104,1280,1536,1792,2048,2103,2560,3072,3584,4096,6144,6288,6293,6294,8192"
 export VLLM_FLASHINFER_AUTOTUNE_TUNING_BUCKETS="${VLLM_FLASHINFER_AUTOTUNE_TUNING_BUCKETS:-$FLASHINFER_TUNING_BUCKETS_DEFAULT}"
 export VLLM_FLASHINFER_AUTOTUNE_ROUND_UP="${VLLM_FLASHINFER_AUTOTUNE_ROUND_UP:-1}"
 
-# Hugging Face Hub：固定 cache 路徑；hf download / huggingface_hub 預設支援 HTTP Range 續傳（.incomplete）。
 HF_HOME="${HF_HOME:-${HOME}/.cache/huggingface}"
 HF_HUB_CACHE="${HF_HUB_CACHE:-${HF_HOME}/hub}"
 export HF_HOME HF_HUB_CACHE
-# huggingface_hub 已棄用 HF_HUB_ENABLE_HF_TRANSFER，改用 Xet 路徑加速下載。
 export HF_XET_HIGH_PERFORMANCE="${HF_XET_HIGH_PERFORMANCE:-1}"
 unset HF_HUB_ENABLE_HF_TRANSFER
 
-# 避免從全域 site-packages 載入不相干或缺失的 vLLM plugin（如 axionml_gemma4）。
-# 空字串表示「不載入任何外掛」。
 export VLLM_PLUGINS="${VLLM_PLUGINS:-}"
 
-# 相容舊環境：可沿用 VLLM_* 設定，但不要 export 給 Python（避免 Unknown vLLM environment variable）。
-PORT="${VLLM_API_PORT:-8002}"
+PORT="${VLLM_API_PORT:-8004}"
 _MODEL_LEN="${VLLM_MAX_MODEL_LEN:-65536}"
 _MAX_SEQS="${VLLM_MAX_NUM_SEQS:-8}"
 _BATCHED="${VLLM_MAX_NUM_BATCHED_TOKENS:-8192}"
 MM_CACHE_GB="${VLLM_MM_PROCESSOR_CACHE_GB:-0}"
 ENABLE_CHUNKED_PREFILL="${VLLM_ENABLE_CHUNKED_PREFILL:-1}"
-# v0.25.1：chunk 大小以 long-prefill-token-threshold 限制每步 prefill token（0=不限制）
 LONG_PREFILL_TOKEN_THRESHOLD="${VLLM_LONG_PREFILL_TOKEN_THRESHOLD:-4096}"
 EXTENDED_PREFILL_WARMUP="${VLLM_EXTENDED_PREFILL_WARMUP:-1}"
-ENABLE_LANGUAGE_MODEL_ONLY="${VLLM_LANGUAGE_MODEL_ONLY:-0}"
+# 預設純文字 TPS；開 vision：VLLM_LANGUAGE_MODEL_ONLY=0
+ENABLE_LANGUAGE_MODEL_ONLY="${VLLM_LANGUAGE_MODEL_ONLY:-1}"
 MM_LIMIT_IMAGE="${VLLM_MM_LIMIT_IMAGE:-2}"
 MM_LIMIT_VIDEO="${VLLM_MM_LIMIT_VIDEO:-0}"
 
-QWEN_MODEL_ID="${QWEN_MODEL_ID:-nvidia/Qwen3.6-35B-A3B-NVFP4}"
+QWEN_MODEL_ID="${QWEN_MODEL_ID:-unsloth/Qwen3.8-27B-NVFP4}"
 MODEL_ID="$QWEN_MODEL_ID"
-VLLM_QUANTIZATION="${VLLM_QUANTIZATION:-modelopt}"
-# NVFP4 / Blackwell 說明（SM120 PRO 4000, 260717 實測）：
-#   - checkpoint 量化：FP8×130 層 + W4A16_NVFP4×161 層（MoE/shared-expert/MLP），
-#     無 W4A4（NVFP4）層 → 原生 FP4 tensor-core GEMM 無法套用於此模型。
-#   - log「Your GPU does not have native support for FP4」是 Marlin 路徑固定警告，
-#     意指「走 weight-only FP4 反量化」而非「GPU 不支援 FP4」；Blackwell SM120
-#     對 W4A4 原生 kernel（flashinfer_cutlass/trtllm）是可用的。
-#   - W4A16 在 vLLM 中 activation_key=None，僅 Marlin MoE/Linear 通過 scheme 檢查；
-#     強制 --moe-backend flashinfer_cutlass 會失敗：
-#     ValueError: kernel does not support quantization scheme ...xNone
-#   - flashinfer_trtllm MoE 另有限制：is_device_capability_family(100)，SM120（12.x）
-#     目前不會被選中（vLLM 0.25.1）。
-# 覆寫：VLLM_MOE_BACKEND=marlin|flashinfer_cutlass|auto …（W4A16 checkpoint 請用 marlin）
-MOE_BACKEND="${VLLM_MOE_BACKEND:-marlin}"
-# W4A4 模型在 SM120 可設 flashinfer_cutlass；本 checkpoint 為 W4A16，設了亦無 W4A4 層可受益。
-LINEAR_BACKEND="${VLLM_LINEAR_BACKEND:-auto}"
+# Unsloth compressed-tensors NVFP4；空字串＝交給 vLLM 從 checkpoint 自動偵測
+VLLM_QUANTIZATION="${VLLM_QUANTIZATION:-compressed-tensors}"
+# dense W4A4：預設不傳 --moe-backend / --linear-backend（cute-DSL 由 vLLM 自選）
+MOE_BACKEND="${VLLM_MOE_BACKEND:-}"
+LINEAR_BACKEND="${VLLM_LINEAR_BACKEND:-}"
 
 KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8}"
-# 直接指定 KV cache 記憶體（bytes）；空值＝交由 gpu-memory-utilization 推算。
-# 統一記憶體平台（DGX Spark）建議明確指定，避免 utilization 以整機記憶體計算失準。
 KV_CACHE_MEMORY_BYTES="${VLLM_KV_CACHE_MEMORY_BYTES:-}"
 ENABLE_PREFIX_CACHING="${VLLM_ENABLE_PREFIX_CACHING:-1}"
-# auto tool choice：Qwen3 系列用 qwen3_xml（非 qwen）；覆寫 VLLM_TOOL_CALL_PARSER
-TOOL_CALL_PARSER="${VLLM_TOOL_CALL_PARSER:-qwen3_xml}"
-# 實測（260612 壓測 log）：0.82 時 KV cache 容量約 215K tokens，8 併發長文
-# （每則 ~29.4K prompt + 5.2K 輸出 ≈ 278K tokens 峰值）只能同跑 7 個請求，
-# KV usage 卡在 96.2%、恆有 1~2 個 Waiting。提高到 0.90（vLLM 預設）每卡
-# 多出 ~1.3GB KV cache（容量估 ~300K+ tokens），8 路可同跑、無 waiting。
-# 若要釋放更多 VRAM 給其他服務，建議 0.80~0.85。
-GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.94}"
+# Qwen3.8：vLLM recipe 用 qwen3_coder（非 qwen3_xml）
+TOOL_CALL_PARSER="${VLLM_TOOL_CALL_PARSER:-qwen3_coder}"
+GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.90}"
 
-# 實測（SM120, 260611）：CUDA graphs 對此 hybrid linear-attention 模型提升巨大，
-#   eager：單流 12.1 tok/s、4 併發 46.7 tok/s
-#   CUDA graphs（預設）：單流 148 tok/s（12x）、4 併發 327 tok/s（7x）
-#   （eager 模式下每步大量小 kernel launch 成為 CPU 瓶頸）
-# 另實測 --enable-expert-parallel 無增益（eager 下 12.0/46.7），不採用。
-# 若 CUDA graph capture 出問題，可設 VLLM_ENFORCE_EAGER=1 退回 eager。
+# MTP：加快 decode、略降峰值吞吐；吞吐壓測預設關
+VLLM_ENABLE_MTP="${VLLM_ENABLE_MTP:-0}"
+VLLM_MTP_NUM_SPEC_TOKENS="${VLLM_MTP_NUM_SPEC_TOKENS:-2}"
+
 EXTRA_VLLM_ARGS="${EXTRA_VLLM_ARGS:-}"
+if [ "$VLLM_ENABLE_MTP" = "1" ]; then
+    EXTRA_VLLM_ARGS="${EXTRA_VLLM_ARGS:+${EXTRA_VLLM_ARGS} }--speculative-config {\"method\":\"mtp\",\"num_speculative_tokens\":${VLLM_MTP_NUM_SPEC_TOKENS}}"
+fi
 if [ "${VLLM_ENFORCE_EAGER:-0}" != "0" ]; then
     if [[ " ${EXTRA_VLLM_ARGS} " != *" --enforce-eager"* ]]; then
         EXTRA_VLLM_ARGS="${EXTRA_VLLM_ARGS:+${EXTRA_VLLM_ARGS} }--enforce-eager"
     fi
 fi
 
+if [ "${MOE_BACKEND}" = "marlin" ]; then
+    printf '[WARN] Unsloth NVFP4 為 W4A4；--moe-backend marlin 會退化成 W4A16（約 2.5× 更慢）。\n' >&2
+fi
+
 printf '\n┌──────────────────────────────────────────────────────────────┐\n'
-printf '│ %-60s │\n' "vLLM｜Qwen3.6-35B-A3B｜NVIDIA NVFP4｜TP=${TP_SIZE}｜port=${PORT}"
+printf '│ %-60s │\n' "vLLM｜Qwen3.8-27B｜Unsloth NVFP4｜TP=${TP_SIZE}｜port=${PORT}"
 printf '└──────────────────────────────────────────────────────────────┘\n'
 printf '  model=%s\n' "$MODEL_ID"
 printf '  gpu-memory-utilization=%s  max-model-len=%s  max-num-seqs=%s batched=%s\n' \
@@ -285,13 +300,16 @@ if [ -n "$KV_CACHE_MEMORY_BYTES" ]; then
         "$KV_CACHE_MEMORY_BYTES" "$(( KV_CACHE_MEMORY_BYTES / 1073741824 ))"
 fi
 printf '  quant=%s  kv-cache=%s  moe=%s  linear=%s  prefix-caching=%s\n' \
-    "$VLLM_QUANTIZATION" "$KV_CACHE_DTYPE" "$MOE_BACKEND" "$LINEAR_BACKEND" "$ENABLE_PREFIX_CACHING"
+    "${VLLM_QUANTIZATION:-auto}" "$KV_CACHE_DTYPE" "${MOE_BACKEND:-auto}" \
+    "${LINEAR_BACKEND:-auto}" "$ENABLE_PREFIX_CACHING"
 printf '  chunked-prefill=%s  long-prefill-threshold=%s  batched=%s  extended-prefill-warmup=%s\n' \
     "$ENABLE_CHUNKED_PREFILL" "$LONG_PREFILL_TOKEN_THRESHOLD" "$_BATCHED" "$EXTENDED_PREFILL_WARMUP"
-printf '  auto-tool-choice=1  tool-call-parser=%s\n' "$TOOL_CALL_PARSER"
+printf '  auto-tool-choice=1  tool-call-parser=%s  mtp=%s\n' \
+    "$TOOL_CALL_PARSER" "$VLLM_ENABLE_MTP"
 printf '  language-model-only=%s  mm-limit(image=%s,video=%s)\n' \
     "$ENABLE_LANGUAGE_MODEL_ONLY" "$MM_LIMIT_IMAGE" "$MM_LIMIT_VIDEO"
-printf '  hf-cache=%s  hf-preload=%s\n' "$HF_HUB_CACHE" "${VLLM_HF_PRELOAD:-1}"
+printf '  hf-cache=%s  hf-preload=%s  CUTE_DSL_ARCH=%s\n' \
+    "$HF_HUB_CACHE" "${VLLM_HF_PRELOAD:-1}" "${CUTE_DSL_ARCH:-unset}"
 printf '  API: http://0.0.0.0:%s/v1/models\n' "$PORT"
 printf '\n'
 
@@ -354,7 +372,10 @@ if [ -n "$KV_CACHE_MEMORY_BYTES" ]; then
             "$GPU_MEMORY_UTILIZATION" >&2
     fi
 fi
-OPT_QUANT="$(_pick_flag "--quantization" --quantization "$VLLM_QUANTIZATION")"
+OPT_QUANT=""
+if [ -n "$VLLM_QUANTIZATION" ]; then
+    OPT_QUANT="$(_pick_flag "--quantization" --quantization "$VLLM_QUANTIZATION")"
+fi
 OPT_PREFIX=""
 if [ "$ENABLE_PREFIX_CACHING" = "1" ]; then
     OPT_PREFIX="$(_pick_flag "--enable-prefix-caching" --enable-prefix-caching)"
@@ -369,13 +390,11 @@ if [ "$ENABLE_CHUNKED_PREFILL" = "1" ]; then
     fi
 fi
 OPT_ASYNC="$(_pick_flag "--async-scheduling" --async-scheduling)"
-# auto tool choice：需要 --enable-auto-tool-choice 與 --tool-call-parser
 OPT_AUTO_TOOL="$(_pick_flag "--enable-auto-tool-choice" --enable-auto-tool-choice)"
 OPT_TOOL_PARSER=""
 if [ -n "$OPT_AUTO_TOOL" ]; then
     OPT_TOOL_PARSER="$(_pick_flag "--tool-call-parser" --tool-call-parser "$TOOL_CALL_PARSER")"
 fi
-# extended-prefill-warmup：nightly 若尚無此旗標，改以 FlashInfer autotune（以 max-num-batched-tokens 規模 warmup）
 OPT_EXTENDED_WARMUP=""
 if [ "$EXTENDED_PREFILL_WARMUP" = "1" ]; then
     OPT_EXTENDED_WARMUP="$(_pick_flag "--extended-prefill-warmup" --extended-prefill-warmup)"
@@ -383,9 +402,14 @@ if [ "$EXTENDED_PREFILL_WARMUP" = "1" ]; then
         OPT_EXTENDED_WARMUP="$(_pick_flag "--enable-flashinfer-autotune" --enable-flashinfer-autotune)"
     fi
 fi
-# W4A16_NVFP4 checkpoint：Marlin 為唯一可用 MoE backend（見上方註解）
-OPT_MOE="$(_pick_flag "--moe-backend" --moe-backend "$MOE_BACKEND")"
-OPT_LINEAR="$(_pick_flag "--linear-backend" --linear-backend "$LINEAR_BACKEND")"
+OPT_MOE=""
+if [ -n "$MOE_BACKEND" ]; then
+    OPT_MOE="$(_pick_flag "--moe-backend" --moe-backend "$MOE_BACKEND")"
+fi
+OPT_LINEAR=""
+if [ -n "$LINEAR_BACKEND" ] && [ "$LINEAR_BACKEND" != "auto" ]; then
+    OPT_LINEAR="$(_pick_flag "--linear-backend" --linear-backend "$LINEAR_BACKEND")"
+fi
 OPT_MMCACHE="$(_pick_flag "--mm-processor-cache-gb" --mm-processor-cache-gb "$MM_CACHE_GB")"
 
 LANG_ONLY=""
@@ -397,17 +421,23 @@ if [ "$ENABLE_LANGUAGE_MODEL_ONLY" != "1" ] && echo "$_vllm_help" | grep -q -- '
     OPT_MM_LIMIT="--limit-mm-per-prompt {\"image\":${MM_LIMIT_IMAGE},\"video\":${MM_LIMIT_VIDEO}}"
 fi
 
+LOG_REQUEST_FLAG=""
+if echo "$_vllm_help" | grep -q -- '--no-enable-log-requests'; then
+    LOG_REQUEST_FLAG="--no-enable-log-requests"
+elif echo "$_vllm_help" | grep -q -- '--disable-log-requests'; then
+    LOG_REQUEST_FLAG="--disable-log-requests"
+fi
+
 unset _vllm_help
 
-# Bash 設定用 VLLM_* 勿傳入 Python（v0.25.1 掃描 VLLM_ 前綴並警告 Unknown）
 unset VLLM_MAX_MODEL_LEN VLLM_MAX_NUM_SEQS VLLM_MAX_NUM_BATCHED_TOKENS \
     VLLM_ENABLE_CHUNKED_PREFILL VLLM_LONG_PREFILL_TOKEN_THRESHOLD \
     VLLM_ENABLE_PREFIX_CACHING VLLM_EXTENDED_PREFILL_WARMUP VLLM_API_PORT \
     VLLM_MM_PROCESSOR_CACHE_GB VLLM_LANGUAGE_MODEL_ONLY VLLM_MM_LIMIT_IMAGE VLLM_MM_LIMIT_VIDEO \
     VLLM_FLASHINFER_AUTOTUNE_TUNING_BUCKETS VLLM_FLASHINFER_AUTOTUNE_ROUND_UP VLLM_HF_PRELOAD \
-    VLLM_TENSOR_PARALLEL_SIZE VLLM_KV_CACHE_MEMORY_BYTES
+    VLLM_TENSOR_PARALLEL_SIZE VLLM_KV_CACHE_MEMORY_BYTES VLLM_ENABLE_MTP \
+    VLLM_MTP_NUM_SPEC_TOKENS VLLM_MOE_BACKEND VLLM_LINEAR_BACKEND VLLM_TOOL_CALL_PARSER
 
-# EXTRA_VLLM_ARGS：附加合法 api_server 參數
 # shellcheck disable=SC2086
 exec python -m vllm.entrypoints.openai.api_server \
     --model "$MODEL_ID" \
@@ -434,6 +464,7 @@ exec python -m vllm.entrypoints.openai.api_server \
     $OPT_MMCACHE \
     $LANG_ONLY \
     $OPT_MM_LIMIT \
+    $LOG_REQUEST_FLAG \
     ${EXTRA_VLLM_ARGS} \
     --host 0.0.0.0 \
     --port "$PORT"

@@ -11,6 +11,7 @@ import base64
 from datetime import datetime
 from statistics import mean, pstdev
 from typing import Optional
+from urllib.parse import urlparse, urlunparse
 
 try:
     import torch
