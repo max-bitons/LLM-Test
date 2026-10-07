@@ -64,8 +64,8 @@ Thumbs.db
 .hf_cache/
 huggingface/
 
-# Optional: local model / checkpoint dirs (uncomment if you store weights here)
-# models/
+# Local model weights (large downloads)
+models/
 # checkpoints/
 
 # Reports
