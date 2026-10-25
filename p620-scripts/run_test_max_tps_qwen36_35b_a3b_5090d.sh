@@ -3,18 +3,18 @@
 # 對齊 start_vllm_qwen36_35b_a3b_5090d.sh（TP=1、port 8002）
 #
 # 填段預留 chat template 2200 + slack 640，使 prompt + max_tokens 落在 max-model-len 內。
-# 預設 CAPACITY_PROFILE=x4_96k：4 併發、96K ctx、pad=87272、max_tokens=8192
+# 預設 CAPACITY_PROFILE=x20_16k：20 併發、16K ctx、pad=9448、max_tokens=4096
 #
 # 用法（伺服器須以相同 profile 先啟動）：
 #   ./start_vllm_qwen36_35b_a3b_5090d.sh
 #   ./p620-scripts/run_test_max_tps_qwen36_35b_a3b_5090d.sh
-#   CAPACITY_PROFILE=x8_32k ./p620-scripts/run_test_max_tps_qwen36_35b_a3b_5090d.sh
+#   CAPACITY_PROFILE=x5_96k ./p620-scripts/run_test_max_tps_qwen36_35b_a3b_5090d.sh
 #
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-CAPACITY_PROFILE="${CAPACITY_PROFILE:-x4_96k}"
+CAPACITY_PROFILE="${CAPACITY_PROFILE:-x20_16k}"
 case "$CAPACITY_PROFILE" in
     x2_16k)
         _DEF_CONCURRENT=2
@@ -40,12 +40,36 @@ case "$CAPACITY_PROFILE" in
         _DEF_PAD=54504
         _DEF_MAX_TOKENS=8192
         ;;
-    x4_96k|*)
+    x12_96k)
+        _DEF_CONCURRENT=12
+        _DEF_MODEL_LEN=98304
+        _DEF_PAD=87272
+        _DEF_MAX_TOKENS=8192
+        ;;
+    x10_96k)
+        _DEF_CONCURRENT=10
+        _DEF_MODEL_LEN=98304
+        _DEF_PAD=87272
+        _DEF_MAX_TOKENS=8192
+        ;;
+    x5_96k)
+        _DEF_CONCURRENT=5
+        _DEF_MODEL_LEN=98304
+        _DEF_PAD=87272
+        _DEF_MAX_TOKENS=8192
+        ;;
+    x4_96k)
         _DEF_CONCURRENT=4
         _DEF_MODEL_LEN=98304
         _DEF_PAD=87272
         _DEF_MAX_TOKENS=8192
-        CAPACITY_PROFILE=x4_96k
+        ;;
+    x20_16k|*)
+        _DEF_CONCURRENT=20
+        _DEF_MODEL_LEN=16384
+        _DEF_PAD=9448
+        _DEF_MAX_TOKENS=4096
+        CAPACITY_PROFILE=x20_16k
         ;;
 esac
 
