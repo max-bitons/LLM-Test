@@ -325,6 +325,13 @@ printf '  Thinking: %s | VLLM_USE_V2_MODEL_RUNNER: %s\n' "$ENABLE_THINKING" "$VL
 printf '  Diffusion: sampler=%s entropy_bound=%s canvas=%s | gen-config=%s\n' "$DIFFUSION_SAMPLER" "$DIFFUSION_ENTROPY_BOUND" "$DIFFUSION_CANVAS_LENGTH" "$GENERATION_CONFIG"
 printf '  Context: %s tokens | Max Seqs: %s | Port: %s\n\n' "$_MODEL_LEN" "$_MAX_SEQS" "$PORT"
 
+# 追加 stdout/stderr 到 logs/vllm-$PORT.log，供 test_max_tps.py 收錄測試區間。
+if [ -f "${SCRIPT_DIR}/vllm_server_log.sh" ]; then
+    # shellcheck source=/dev/null
+    . "${SCRIPT_DIR}/vllm_server_log.sh"
+    vllm_redirect_server_log "$PORT"
+fi
+
 # shellcheck disable=SC2086
 exec python -m vllm.entrypoints.openai.api_server \
     --model "$MODEL_ID" \

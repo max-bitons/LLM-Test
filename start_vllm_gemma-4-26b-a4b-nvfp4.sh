@@ -243,6 +243,13 @@ if python -c "import transformers as t; raise SystemExit(0 if tuple(int(x) for x
     printf '[INFO] transformers>=5.15 → 使用 Gemma4 heterogeneous config boot wrapper\n'
 fi
 
+# 追加 stdout/stderr 到 logs/vllm-$PORT.log，供 test_max_tps.py 收錄測試區間。
+if [ -f "${SCRIPT_DIR}/vllm_server_log.sh" ]; then
+    # shellcheck source=/dev/null
+    . "${SCRIPT_DIR}/vllm_server_log.sh"
+    vllm_redirect_server_log "$PORT"
+fi
+
 # shellcheck disable=SC2086
 exec "${_VLLM_PY[@]}" -m vllm.entrypoints.openai.api_server \
     --model "$MODEL_ID" \

@@ -14,6 +14,7 @@ import os
 import pathlib
 import platform
 import random
+import re
 import subprocess
 import sys
 from urllib.parse import quote, urlparse, urlunparse
@@ -242,6 +243,17 @@ STRESS_SUSTAIN_SEC = 0.0
 # （題目與填段皆相同），量測伺服器 --enable-prefix-caching 全段命中時的 prefill 效益；
 # 波次不足 2 時自動補為 2 波。僅波次模式有效（--stress-seconds 持續模式不適用）。
 PREFIX_CACHE_TEST = os.environ.get("VLLM_PREFIX_CACHE_TEST", "0").strip().lower() in ("1", "true", "yes", "on")
+# vLLM 伺服器日誌：CLI／環境變數寫入；省略時自動找 logs/vllm-<port>.log
+_VLLM_LOG_EXPLICIT: str | None = None
+_VLLM_LOG_DISABLED = False
+_VLLM_LOG_EMBED_MAX_CHARS = 160_000
+_VLLM_LOG_HIGHLIGHT_MAX_LINES = 200
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*(?:\x07|\x1b\\)")
+_VLLM_LOG_HIGHLIGHT_RE = re.compile(
+    r"prefix cache|throughput|kv cache|traceback|out of memory|cuda error"
+    r"|\b(?:error|warning|critical|exception)\b",
+    re.IGNORECASE,
+)
 # max_tokens：預設「自動」— 取自 GET /v1/models 模型欄位後 ×110%（ceil）；再收斂至 max_model_len−輸入預留；
 # 無可用欄位則固定 16K（不重乘）。強制指定：CLI --max-tokens 優先於 VLLM_MAX_TOKENS。
 AUTO_MAX_TOKENS_FALLBACK = 16384
@@ -393,6 +405,186 @@ def _reports_max_tps_md_path() -> str:
     return os.path.join(out_dir, f"test_max_tps_report-{stamp}.md")
 
 
+class _VllmLogSlice:
+    """測試開始時記下日誌檔位移，結束時只讀新增的位元組。"""
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+        self.offset = 0
+        self.inode: int | None = None
+        self.existed = False
+        self.note = ""
+        self.text = ""
+        self.raw_bytes = 0
+        self.started_at = ""
+        self.finished_at = ""
+
+    def mark_start(self) -> None:
+        self.started_at = datetime.now().isoformat(timespec="seconds")
+        try:
+            st = os.stat(self.path)
+        except FileNotFoundError:
+            self.existed = False
+            self.offset = 0
+            self.inode = None
+            return
+        except OSError as exc:
+            self.note = f"無法讀取日誌起點：{exc}"
+            return
+        self.existed = True
+        self.offset = st.st_size
+        self.inode = st.st_ino
+
+    def finish(self) -> None:
+        self.finished_at = datetime.now().isoformat(timespec="seconds")
+        try:
+            st = os.stat(self.path)
+        except FileNotFoundError:
+            self.note = "測試結束時日誌檔仍不存在。"
+            self.text = ""
+            self.raw_bytes = 0
+            return
+        except OSError as exc:
+            self.note = f"無法讀取日誌：{exc}"
+            return
+        try:
+            with open(self.path, "rb") as fh:
+                if self.inode is not None and st.st_ino != self.inode:
+                    self.note = "測試期間日誌檔被替換，改收錄替換後的全文。"
+                    fh.seek(0)
+                elif st.st_size < self.offset:
+                    self.note = "測試期間日誌檔被截斷，改收錄截斷後的全文。"
+                    fh.seek(0)
+                else:
+                    fh.seek(self.offset)
+                data = fh.read()
+        except OSError as exc:
+            self.note = f"無法讀取日誌內容：{exc}"
+            return
+        self.raw_bytes = len(data)
+        text = data.decode("utf-8", errors="replace")
+        text = _ANSI_ESCAPE_RE.sub("", text).replace("\r\n", "\n").replace("\r", "\n")
+        self.text = text
+
+
+def _resolve_vllm_log_target() -> tuple[str | None, str]:
+    """回傳 (path, mode)。mode 為 disabled、explicit、auto、absent。"""
+    if _VLLM_LOG_DISABLED:
+        return None, "disabled"
+    if _VLLM_LOG_EXPLICIT:
+        return _VLLM_LOG_EXPLICIT, "explicit"
+    repo = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    logs_dir = os.path.join(repo, "logs")
+    port = urlparse(_LLM_BASE).port
+    candidates: list[str] = []
+    if port:
+        candidates.append(os.path.join(logs_dir, f"vllm-{port}.log"))
+    candidates.append(os.path.join(logs_dir, "vllm-server.log"))
+    for path in candidates:
+        if os.path.isfile(path):
+            return path, "auto"
+    return None, "absent"
+
+
+def _begin_vllm_log_capture() -> _VllmLogSlice | None:
+    path, mode = _resolve_vllm_log_target()
+    if path is None:
+        if mode == "absent":
+            port = urlparse(_LLM_BASE).port
+            expect = f"logs/vllm-{port}.log" if port else "logs/vllm-<port>.log"
+            print(
+                f"vLLM log: 未擷取（找不到 {expect}）。"
+                "用更新後的 start_vllm_*.sh 啟動後會寫入該檔，或指定 --vllm-log PATH。",
+                flush=True,
+            )
+        return None
+    cap = _VllmLogSlice(path)
+    cap.mark_start()
+    print(f"vLLM log: 開始擷取 {path}（自第 {cap.offset:,} byte）", flush=True)
+    return cap
+
+
+def _escape_md_fence(text: str) -> str:
+    return text.replace("```", "'''")
+
+
+def _vllm_log_highlights(text: str) -> tuple[list[str], int]:
+    matched: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped and _VLLM_LOG_HIGHLIGHT_RE.search(stripped):
+            if len(stripped) > 500:
+                stripped = stripped[:499] + "…"
+            matched.append(stripped)
+    total = len(matched)
+    if total > _VLLM_LOG_HIGHLIGHT_MAX_LINES:
+        return matched[-_VLLM_LOG_HIGHLIGHT_MAX_LINES:], total
+    return matched, total
+
+
+def _format_vllm_log_section(captured: _VllmLogSlice, sidecar_name: str | None) -> str:
+    meta = [
+        "## vLLM 伺服器日誌（測試期間）",
+        "",
+        f"- **日誌檔:** `{captured.path}`",
+        f"- **測試區間:** {captured.started_at} → {captured.finished_at}",
+    ]
+    if captured.existed:
+        meta.append(f"- **起點位移:** {captured.offset:,} bytes")
+    meta.append(f"- **本次收錄:** {captured.raw_bytes:,} bytes")
+    if sidecar_name:
+        meta.append(f"- **原始摘錄:** `{sidecar_name}`")
+    if captured.note:
+        meta.append(f"- **備註:** {captured.note}")
+    chunks = ["\n".join(meta), ""]
+    body = captured.text
+    if not body.strip():
+        chunks.append("測試期間日誌檔沒有新增內容。")
+        chunks.append("")
+        chunks.append("---")
+        chunks.append("")
+        return "\n".join(chunks)
+
+    highlights, total = _vllm_log_highlights(body)
+    if highlights:
+        label = "### 重點摘錄"
+        if total > len(highlights):
+            label += f"（符合 {total} 行，列出最後 {len(highlights)} 行）"
+        chunks.append(label)
+        chunks.append("")
+        chunks.append("```text")
+        chunks.append(_escape_md_fence("\n".join(highlights)))
+        chunks.append("```")
+        chunks.append("")
+
+    truncated = len(body) > _VLLM_LOG_EMBED_MAX_CHARS
+    embed = body
+    if truncated:
+        embed = body[-_VLLM_LOG_EMBED_MAX_CHARS :]
+        cut = embed.find("\n")
+        if 0 <= cut < 400:
+            embed = embed[cut + 1 :]
+        note = (
+            f"日誌共 {len(body):,} 字，超過內嵌上限 {_VLLM_LOG_EMBED_MAX_CHARS:,} 字，以下為尾段。"
+        )
+        if sidecar_name:
+            note += f" 完整內容見 `{sidecar_name}`。"
+        chunks.append("### 日誌尾段")
+        chunks.append("")
+        chunks.append(note)
+        chunks.append("")
+    else:
+        chunks.append("### 日誌全文")
+        chunks.append("")
+    chunks.append("```text")
+    chunks.append(_escape_md_fence(embed).rstrip("\n"))
+    chunks.append("```")
+    chunks.append("")
+    chunks.append("---")
+    chunks.append("")
+    return "\n".join(chunks)
+
+
 def parse_cli(argv=None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description=(
@@ -406,6 +598,8 @@ def parse_cli(argv=None) -> argparse.Namespace:
             "單則產出在預設 **120 s**（`VLLM_STREAM_GENERATION_TIMEOUT`）內須完成，否則中止該請求並記錄。"
             "在 TTY、已安裝 **rich**、且為 SSE 模式時，可加 `--rich-live` 或設 `VLLM_RICH_LIVE=1` 顯示各路請求即時 delta（預設關閉）。"
             "**壓力測試：** `-R N` 連續 N 波同併發；`--stress-seconds SEC` 在 SEC 秒內維持併發不斷送新請求。"
+            "測試期間若存在 `logs/vllm-<port>.log`（由 start_vllm_*.sh 追加），會把該區間日誌收進報告；"
+            "`--vllm-log` 指定路徑，`--no-vllm-log` 關閉。"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
@@ -443,6 +637,8 @@ def parse_cli(argv=None) -> argparse.Namespace:
             "  python p620-scripts/test_max_tps.py -u http://127.0.0.1:8004 -c 4 --prompt-pad-tokens 8192 --max-tokens 256\n"
             "  # 壓力：180 秒內維持 8 路併發不斷送新請求（最簡設定建議保守）\n"
             "  python p620-scripts/test_max_tps.py -u http://127.0.0.1:8004 -c 8 --stress-seconds 180 --max-tokens 512\n"
+            "  # 收錄測試期間的 vLLM 日誌（start_vllm_*.sh 預設寫入 logs/vllm-<port>.log）：\n"
+            "  python p620-scripts/test_max_tps.py -u http://127.0.0.1:8002 --vllm-log logs/vllm-8002.log\n"
         ),
     )
     p.add_argument(
@@ -568,6 +764,21 @@ def parse_cli(argv=None) -> argparse.Namespace:
             "即時 Rich 面板在此模式下自動關閉。"
         ),
     )
+    p.add_argument(
+        "--vllm-log",
+        default=None,
+        metavar="PATH",
+        help=(
+            "vLLM 伺服器日誌檔。測試開始時記錄檔案大小，結束時把新增內容寫入報告。"
+            "省略時若存在 logs/vllm-<埠>.log（start_vllm_*.sh 會寫入）則自動擷取。"
+            "亦可設環境變數 VLLM_SERVER_LOG。"
+        ),
+    )
+    p.add_argument(
+        "--no-vllm-log",
+        action="store_true",
+        help="不要擷取 vLLM 伺服器日誌（等同 VLLM_CAPTURE_SERVER_LOG=0）。",
+    )
     return p.parse_args(argv)
 
 
@@ -581,6 +792,7 @@ def apply_cli_to_globals(args: argparse.Namespace) -> None:
     global STRESS_ROUNDS, STRESS_SUSTAIN_SEC
     global PROMPT_PAD_TARGET_TOKENS
     global AUTO_SHRINK_PROMPT_PAD
+    global _VLLM_LOG_EXPLICIT, _VLLM_LOG_DISABLED
     if getattr(args, "no_adaptive_pad", False):
         AUTO_SHRINK_PROMPT_PAD = False
     if args.port is not None:
@@ -627,6 +839,27 @@ def apply_cli_to_globals(args: argparse.Namespace) -> None:
     if PREFIX_CACHE_TEST and STRESS_SUSTAIN_SEC <= 0 and STRESS_ROUNDS < 2:
         STRESS_ROUNDS = 2
         print("ℹ️  VLLM_PREFIX_CACHE_TEST=1：自動補為 2 波（第 2 波重用第一波 prompts 測 prefix cache 命中）。", flush=True)
+    if args.no_vllm_log:
+        _VLLM_LOG_DISABLED = True
+        _VLLM_LOG_EXPLICIT = None
+    elif args.vllm_log:
+        _VLLM_LOG_DISABLED = False
+        _VLLM_LOG_EXPLICIT = str(args.vllm_log)
+    else:
+        env_log = os.environ.get("VLLM_SERVER_LOG", "").strip()
+        cap_flag = os.environ.get("VLLM_CAPTURE_SERVER_LOG", "").strip().lower()
+        if cap_flag in ("0", "false", "no", "off") or env_log.lower() in (
+            "0",
+            "false",
+            "no",
+            "off",
+            "none",
+        ):
+            _VLLM_LOG_DISABLED = True
+            _VLLM_LOG_EXPLICIT = None
+        else:
+            _VLLM_LOG_DISABLED = False
+            _VLLM_LOG_EXPLICIT = env_log or None
 
 
 async def preflight_local_llm(session: aiohttp.ClientSession) -> None:
@@ -1686,6 +1919,7 @@ async def run_sustained_stress(session: aiohttp.ClientSession) -> list[dict]:
 async def main(skip_preflight: bool = False, model_override=None) -> None:
     global MAX_TOKENS, _MAX_TOKENS_NOTE
     global _PROMPT_PAD_ADJUST_NOTE
+    vllm_cap = _begin_vllm_log_capture()
     glob_start = time.time()
     stress_profile = ""
     req_timeout = aiohttp.ClientTimeout(total=_HTTP_TIMEOUT)
@@ -1993,6 +2227,27 @@ async def main(skip_preflight: bool = False, model_override=None) -> None:
     )
 
     log_filename = _reports_max_tps_md_path()
+    vllm_log_md = ""
+    vllm_sidecar_path = ""
+    if vllm_cap is not None:
+        vllm_cap.finish()
+        sidecar_name = None
+        if vllm_cap.text.strip():
+            vllm_sidecar_path = (
+                log_filename.removesuffix(".md") + ".vllm.log"
+                if log_filename.endswith(".md")
+                else log_filename + ".vllm.log"
+            )
+            with open(vllm_sidecar_path, "w", encoding="utf-8") as sf:
+                sf.write(vllm_cap.text)
+                if not vllm_cap.text.endswith("\n"):
+                    sf.write("\n")
+            sidecar_name = os.path.basename(vllm_sidecar_path)
+        vllm_log_md = _format_vllm_log_section(vllm_cap, sidecar_name)
+        print(
+            f"vLLM log: {vllm_cap.path}  +{vllm_cap.raw_bytes:,} bytes",
+            flush=True,
+        )
     with open(log_filename, "w", encoding="utf-8") as f:
         f.write("# Token 產能／併發測試結果日誌\n\n")
         f.write("## System prompt（角色扮演）\n\n")
@@ -2000,6 +2255,8 @@ async def main(skip_preflight: bool = False, model_override=None) -> None:
         f.write(md_head)
         if wave_summary_md:
             f.write(wave_summary_md)
+        if vllm_log_md:
+            f.write(vllm_log_md)
         f.write(f"{system_info_md}\n\n---\n\n")
 
         for r in sorted(
@@ -2060,6 +2317,8 @@ async def main(skip_preflight: bool = False, model_override=None) -> None:
             f.write("---\n\n")
                 
     print(f"報告: {log_filename}")
+    if vllm_sidecar_path:
+        print(f"vLLM log 摘錄: {vllm_sidecar_path}")
 
 if __name__ == "__main__":
     _args = parse_cli()

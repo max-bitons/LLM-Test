@@ -23,10 +23,12 @@
 # Hugging Face 續傳：預設 VLLM_HF_PRELOAD=1；可設 VLLM_HF_PRELOAD=0 或 HF_HUB_OFFLINE=1。
 #
 # 用法：
-#   ./start_vllm_qwen36_35b_a3b_tp2_5060ti.sh                         # 5060 Ti 預設（8 併發／64K）
-#   ./start_vllm_qwen36_35b_a3b_tp2_pro4000.sh                        # PRO 4000 量能 profile
+#   ./start_vllm_qwen36_35b_a3b_tp2_5060ti.sh                         # 5060 Ti 預設（8 併發／64K、TP=2）
+#   ./start_vllm_qwen36_35b_a3b_tp2_pro4000.sh                        # PRO 4000 量能 profile（TP=2）
 #   ./start_vllm_qwen36_35b_a3b_DGX.sh                                # DGX Spark 單卡（TP=1、64GiB KV）
+#   ./start_vllm_qwen36_35b_a3b_5090d.sh                              # 單張 RTX 5090 D（TP=1）
 #   CUDA_VISIBLE_DEVICES=0,1 ./start_vllm_qwen36_35b_a3b_tp2_5060ti.sh
+#   VLLM_TENSOR_PARALLEL_SIZE=1 ./start_vllm_qwen36_35b_a3b_tp2_5060ti.sh   # 單卡；預設仍為 2
 #
 # 壓測：p620-scripts/run_test_max_tps_qwen36_35b_a3b_turboquant.sh（5060 8 併發／64K）
 #       p620-scripts/run_test_max_tps_qwen36_35b_a3b_turboquant_pro4000.sh（PRO 4000）
@@ -183,13 +185,22 @@ _visible_gpu_count() {
     nvidia-smi -L 2>/dev/null | grep -c '^GPU' || true
 }
 
-# TP 大小可覆寫（DGX 單卡 wrapper 設 1；預設維持 2）
+# 預設 TP=2（5060 Ti／PRO 4000）。單卡由 DGX／5090d wrapper 設為 1。
 TP_SIZE="${VLLM_TENSOR_PARALLEL_SIZE:-2}"
+if ! [[ "$TP_SIZE" =~ ^[1-9][0-9]*$ ]]; then
+    printf '[ERROR] VLLM_TENSOR_PARALLEL_SIZE 必須為正整數（目前=%s）。\n' "$TP_SIZE" >&2
+    exit 1
+fi
+
 _gc=$(_visible_gpu_count)
-if ! [ "${_gc:-0}" -ge "${TP_SIZE}" ] 2>/dev/null; then
+if ! [ "${_gc:-0}" -ge "$TP_SIZE" ] 2>/dev/null; then
     printf '[ERROR] TP=%s 需要至少 %s 張目前可見的 GPU（nvidia-smi -L 計得 %s）。\n' \
-        "${TP_SIZE}" "${TP_SIZE}" "${_gc:-0}" >&2
-    printf '       請使用 CUDA_VISIBLE_DEVICES 或檢查驅動。\n' >&2
+        "$TP_SIZE" "$TP_SIZE" "${_gc:-0}" >&2
+    if [ "$TP_SIZE" -ge 2 ]; then
+        printf '       單卡請用 start_vllm_qwen36_35b_a3b_5090d.sh 或 start_vllm_qwen36_35b_a3b_DGX.sh；雙卡請設 CUDA_VISIBLE_DEVICES=0,1。\n' >&2
+    else
+        printf '       請確認 NVIDIA 驅動，或設定 CUDA_VISIBLE_DEVICES。\n' >&2
+    fi
     exit 1
 fi
 unset _gc
@@ -408,6 +419,13 @@ unset VLLM_MAX_MODEL_LEN VLLM_MAX_NUM_SEQS VLLM_MAX_NUM_BATCHED_TOKENS \
     VLLM_TENSOR_PARALLEL_SIZE VLLM_KV_CACHE_MEMORY_BYTES
 
 # EXTRA_VLLM_ARGS：附加合法 api_server 參數
+# 追加 stdout/stderr 到 logs/vllm-$PORT.log，供 test_max_tps.py 收錄測試區間。
+if [ -f "${SCRIPT_DIR}/vllm_server_log.sh" ]; then
+    # shellcheck source=/dev/null
+    . "${SCRIPT_DIR}/vllm_server_log.sh"
+    vllm_redirect_server_log "$PORT"
+fi
+
 # shellcheck disable=SC2086
 exec python -m vllm.entrypoints.openai.api_server \
     --model "$MODEL_ID" \
